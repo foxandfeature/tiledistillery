@@ -1,0 +1,8 @@
+.claude
+.DS_Store
+__pycache__/
+*.pyc
+manifests/
+*.mbtiles
+*.pmtiles
+*.osm.pbf

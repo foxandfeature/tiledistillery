@@ -1,0 +1,29 @@
+name: CI self-test
+
+# Exercises the full pipeline end to end against a minimal dummy tilemaker
+# config (see docs/ARCHITECTURE.md "CI self-test") — not a real layer, just
+# enough to prove config-referencing, sharding, claiming, and merge work.
+# Scoped to a single tiny leaf so this runs in minutes, not a whole-world
+# build. Also the reference example of the minimal shape any caller needs
+# (see docs/ARCHITECTURE.md "Consumer contract"): call _pipeline.yml with
+# `permissions: contents: write` and nothing else — no concurrency group to
+# set up, _pipeline.yml enforces that itself.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-dummy-layer:
+    uses: ./.github/workflows/_pipeline.yml
+    permissions:
+      contents: write
+    with:
+      config: dummy/config.json
+      process: dummy/process.lua
+      output_basename: ci-dummy
+      attribution: "TileDistillery CI self-test — data (c) OpenStreetMap contributors, ODbL"
+      worker_count: "3"
+      region_scope: "europe/monaco"

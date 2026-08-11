@@ -1,0 +1,314 @@
+name: TileDistillery pipeline (reusable)
+
+# Builds one PMTiles layer from every Geofabrik leaf extract in scope,
+# using the caller's own tilemaker config/process files (see
+# docs/ARCHITECTURE.md). prepare -> build (claim-loop matrix) ->
+# check-complete -> topup (conditional second claim-loop round) ->
+# finalize (verify + merge) -> cleanup (always). Deliberately does NOT
+# publish anywhere (no GitHub Release, no B2 upload) — that's the calling
+# workflow's job, same separation as TileAlchemist's _pipeline.yml.
+#
+# State (claim refs + timing history) lives on the CALLING repo's own
+# `state` branch, never in this repo — see docs/ARCHITECTURE.md "State
+# lives in the caller's repo, not this one". The caller must grant
+# `permissions: contents: write`; this workflow's own `concurrency:` group
+# below (keyed by caller repo + output_basename) is what actually prevents
+# two overlapping runs of the same build from racing over the same claim
+# scope, so the caller does not need its own concurrency group for that.
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: 'Path, in the caller repo, to the tilemaker JSON layer config.'
+        required: true
+        type: string
+      process:
+        description: 'Path, in the caller repo, to the tilemaker Lua process script.'
+        required: true
+        type: string
+      output_basename:
+        description: 'Base name for the output .pmtiles file/artifact, and the scope key for this build''s claims/timing history.'
+        required: true
+        type: string
+      attribution:
+        description: 'HTML attribution string embedded in the merged PMTiles metadata via tile-join --attribution.'
+        required: true
+        type: string
+      worker_count:
+        description: 'How many parallel claim-loop workers to fan out into, per round (see docs/ARCHITECTURE.md "Distribution").'
+        required: false
+        type: string
+        default: "20"
+      region_scope:
+        description: 'Optional Geofabrik path prefix (e.g. "europe/monaco") to restrict the build to a subtree instead of the whole world.'
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: tiledistillery-${{ github.repository }}-${{ inputs.output_basename }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      workers: ${{ steps.gen-workers.outputs.workers }}
+    steps:
+      - name: Checkout tiledistillery (this pipeline's own scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tiledistillery
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r .tiledistillery/scripts/requirements.txt
+
+      - name: Build the run's queue manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .tiledistillery/scripts/leaves.py \
+            --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+            --state-branch state --output-basename "${{ inputs.output_basename }}" \
+            --region-scope "${{ inputs.region_scope }}" \
+            --out queue-manifest.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: queue-manifest
+          path: queue-manifest.json
+
+      - id: gen-workers
+        env:
+          WORKER_COUNT: ${{ inputs.worker_count }}
+        run: echo "workers=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["WORKER_COUNT"])))))')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJson(needs.prepare.outputs.workers) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tiledistillery
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: queue-manifest
+
+      - uses: ./.tiledistillery/.github/actions/claim-and-build
+        with:
+          config: ${{ inputs.config }}
+          process: ${{ inputs.process }}
+          output_basename: ${{ inputs.output_basename }}
+
+      # A worker's whole run can legitimately claim nothing (queue already
+      # empty when it started), so a missing shard file here is expected,
+      # not a failure.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shards-${{ matrix.worker }}
+          path: shards/*.mbtiles
+          if-no-files-found: ignore
+
+  check-complete:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      remaining_count: ${{ steps.check.outputs.remaining_count }}
+    steps:
+      - name: Checkout tiledistillery
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tiledistillery
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r .tiledistillery/scripts/requirements.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: queue-manifest
+
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RESULT=$(python .tiledistillery/scripts/finalize_check.py \
+            --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+            --state-branch state --output-basename "${{ inputs.output_basename }}" \
+            --manifest queue-manifest.json)
+          echo "remaining_count=$(jq '.remaining | length' <<<"$RESULT")" >> "$GITHUB_OUTPUT"
+
+  # A safety net for the realistic edge case in docs/ARCHITECTURE.md
+  # "Worker job shape & the 6-hour limit": a handful of workers hitting
+  # their own time wall near the end of a run while a few regions remain
+  # unclaimed. Reuses the exact same manifest and worker_count; claim.py
+  # next already skips anything done/failed/still-locked, so no filtering
+  # is needed here. Capped at one round (two total, counting `build`).
+  topup:
+    needs: [prepare, check-complete]
+    if: ${{ success() && needs.check-complete.outputs.remaining_count != '0' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJson(needs.prepare.outputs.workers) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tiledistillery
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: queue-manifest
+
+      - uses: ./.tiledistillery/.github/actions/claim-and-build
+        with:
+          config: ${{ inputs.config }}
+          process: ${{ inputs.process }}
+          output_basename: ${{ inputs.output_basename }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shards-topup-${{ matrix.worker }}
+          path: shards/*.mbtiles
+          if-no-files-found: ignore
+
+  finalize:
+    needs: [check-complete, topup]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tiledistillery
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tiledistillery
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r .tiledistillery/scripts/requirements.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: queue-manifest
+
+      # The real gate: fails loudly rather than silently publishing a
+      # world layer with holes in it (see docs/ARCHITECTURE.md "Merge").
+      - name: Confirm every region is done or permanently failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .tiledistillery/scripts/finalize_check.py \
+            --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+            --state-branch state --output-basename "${{ inputs.output_basename }}" \
+            --manifest queue-manifest.json --fail-if-incomplete
+
+      - name: Download every worker's shards (both rounds)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shards-*
+          path: shards
+          merge-multiple: true
+
+      - name: Install tippecanoe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tippecanoe || {
+            git clone --depth 1 https://github.com/felt/tippecanoe.git /tmp/tippecanoe
+            make -C /tmp/tippecanoe -j"$(nproc)"
+            sudo make -C /tmp/tippecanoe install
+          }
+
+      # One flat merge, deliberately not staged by continent — see
+      # docs/ARCHITECTURE.md "Merge".
+      - name: Merge every shard into the final layer
+        env:
+          ATTRIBUTION: ${{ inputs.attribution }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          tile-join --no-tile-size-limit \
+            --attribution="$ATTRIBUTION" \
+            -o "${OUTPUT_BASENAME}.pmtiles" shards/*.mbtiles
+
+      - name: Summarize
+        env:
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          SHARD_COUNT=$(find shards -name '*.mbtiles' | wc -l | tr -d ' ')
+          SIZE=$(du -h "${OUTPUT_BASENAME}.pmtiles" | cut -f1)
+          {
+            echo "### ${OUTPUT_BASENAME} layer"
+            echo "- shards merged: $SHARD_COUNT"
+            echo "- output size: $SIZE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.output_basename }}-pmtiles
+          path: ${{ inputs.output_basename }}.pmtiles
+
+  cleanup:
+    needs: [check-complete, topup, finalize]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tiledistillery
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tiledistillery
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r .tiledistillery/scripts/requirements.txt
+
+      - name: Delete every claim ref from this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .tiledistillery/scripts/cleanup_claims.py \
+            --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+            --output-basename "${{ inputs.output_basename }}"

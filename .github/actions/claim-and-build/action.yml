@@ -1,0 +1,109 @@
+name: 'Claim and build Geofabrik regions'
+description: >
+  Installs tilemaker and this pipeline's own scripts, then loops claiming
+  leaf regions from the shared queue (see docs/ARCHITECTURE.md
+  "Distribution" and "Locking") and building each with tilemaker, until the
+  queue is exhausted or this job runs low on time. Used identically by
+  _pipeline.yml's main build round and its top-up round. Assumes the caller
+  repo is already checked out at the workspace root and this pipeline's own
+  repo under `.tiledistillery/`.
+inputs:
+  config:
+    description: Path, in the caller repo, to the tilemaker JSON layer config.
+    required: true
+  process:
+    description: Path, in the caller repo, to the tilemaker Lua process script.
+    required: true
+  output_basename:
+    required: true
+  manifest:
+    description: Path to the queue-manifest.json produced by the prepare job.
+    required: false
+    default: queue-manifest.json
+  shards_dir:
+    required: false
+    default: shards
+  ttl_seconds:
+    description: Stale-claim TTL passed through to claim.py next.
+    required: false
+    default: "5400"
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install pipeline script dependencies
+      shell: bash
+      run: pip install -r .tiledistillery/scripts/requirements.txt
+
+    - name: Install tilemaker
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y tilemaker || {
+          echo "::warning::tilemaker not available via apt, building from source"
+          sudo apt-get install -y build-essential libboost-dev libboost-filesystem-dev \
+            libboost-program-options-dev libboost-system-dev lua5.3 liblua5.3-dev \
+            libshp-dev libsqlite3-dev rapidjson-dev
+          git clone --depth 1 https://github.com/systemed/tilemaker.git /tmp/tilemaker-src
+          make -C /tmp/tilemaker-src -j"$(nproc)"
+          sudo make -C /tmp/tilemaker-src install
+        }
+
+    - name: Claim and build regions until the queue is empty
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        mkdir -p "${{ inputs.shards_dir }}"
+
+        while true; do
+          CLAIM_JSON=$(python .tiledistillery/scripts/claim.py next \
+            --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+            --state-branch state --output-basename "${{ inputs.output_basename }}" \
+            --manifest "${{ inputs.manifest }}" --ttl-seconds "${{ inputs.ttl_seconds }}")
+
+          CLAIMED=$(jq -r '.claimed' <<<"$CLAIM_JSON")
+          if [ "$CLAIMED" != "true" ]; then
+            echo "queue empty, worker exiting"
+            break
+          fi
+
+          REGION_ID=$(jq -r '.region.id' <<<"$CLAIM_JSON")
+          PBF_URL=$(jq -r '.region.pbf_url' <<<"$CLAIM_JSON")
+          SAFE_NAME=$(tr '/' '_' <<<"$REGION_ID")
+          STORE_DIR="$(mktemp -d)"
+
+          echo "::group::${REGION_ID}"
+          START=$(date +%s)
+          set +e
+          curl -fsSL "$PBF_URL" -o region.osm.pbf \
+            && tilemaker --input region.osm.pbf \
+                 --output "${{ inputs.shards_dir }}/${SAFE_NAME}.mbtiles" \
+                 --config "${{ inputs.config }}" --process "${{ inputs.process }}" \
+                 --store "$STORE_DIR"
+          STATUS=$?
+          set -e
+          rm -f region.osm.pbf
+          rm -rf "$STORE_DIR"
+          END=$(date +%s)
+          echo "::endgroup::"
+
+          if [ "$STATUS" -eq 0 ]; then
+            python .tiledistillery/scripts/claim.py done \
+              --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+              --state-branch state --output-basename "${{ inputs.output_basename }}" \
+              --region-id "$REGION_ID" \
+              --duration-seconds "$((END - START))"
+          else
+            python .tiledistillery/scripts/claim.py failed \
+              --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+              --state-branch state --output-basename "${{ inputs.output_basename }}" \
+              --region-id "$REGION_ID" \
+              --error "build failed (exit ${STATUS})"
+          fi
+        done

@@ -1,0 +1,100 @@
+name: Publish a GitHub Release (reusable)
+
+# Downloads a merged .pmtiles artifact from a _pipeline.yml run, splits it
+# into release-sized parts if needed, and publishes/replaces a fixed-tag
+# GitHub Release.
+#
+# Safe to call cross-repo, unlike _publish-b2.yml (see
+# docs/ARCHITECTURE.md "Publishing"): it only uses the automatic
+# `secrets.GITHUB_TOKEN` (`github.token`), not an `environment:`-scoped
+# secret. `github.token`/`github.repository` inside any job of a called
+# reusable workflow always reflect the *calling* repository, so there's no
+# cross-repo credential leak risk here the way there is for an
+# environment-gated secret.
+
+on:
+  workflow_call:
+    inputs:
+      output_basename:
+        description: 'Base filename inside the "<output_basename>-pmtiles" artifact uploaded by a _pipeline.yml run, e.g. "bins" for bins.pmtiles.'
+        required: true
+        type: string
+      tag:
+        description: 'Fixed release tag, replaced on every run, e.g. "bins-latest".'
+        required: true
+        type: string
+      title:
+        description: 'Release title, e.g. "Trash bin layer".'
+        required: true
+        type: string
+
+jobs:
+  publish-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the merged layer
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.output_basename }}-pmtiles
+
+      - name: Split into release-sized parts if needed
+        id: split
+        env:
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          FILE="${OUTPUT_BASENAME}.pmtiles"
+          LIMIT_BYTES=$((1900 * 1024 * 1024))
+          SIZE_BYTES=$(stat -c%s "$FILE")
+          if [ "$SIZE_BYTES" -gt "$LIMIT_BYTES" ]; then
+            split -b 1900M -d -a 3 "$FILE" "${FILE}.part"
+            echo "split=true" >> "$GITHUB_OUTPUT"
+            ls "${FILE}.part"* > release-assets.txt
+          else
+            echo "split=false" >> "$GITHUB_OUTPUT"
+            echo "$FILE" > release-assets.txt
+          fi
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.title }}
+        run: |
+          FILE="${OUTPUT_BASENAME}.pmtiles"
+          # Fixed tag, replaced on every run rather than kept alongside
+          # older releases; `--cleanup-tag` removes the underlying git tag
+          # too, so it doesn't accumulate either. The delete is expected to
+          # fail (and is ignored) on the very first run.
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag || true
+          DL_CMD="gh release download $TAG --repo ${{ github.repository }}"
+          if [ "${{ steps.split.outputs.split }}" = "true" ]; then
+            UNIX_CMD="$DL_CMD && cat ${FILE}.part* > $FILE"
+            WIN_CMD="$DL_CMD && copy /b ${FILE}.part* $FILE"
+          else
+            UNIX_CMD="$DL_CMD"
+            WIN_CMD="$DL_CMD"
+          fi
+          printf '%s\n' \
+            "${TITLE}." \
+            "Built $(date -u +%Y-%m-%d) (run #${{ github.run_number }})." \
+            "" \
+            "Download (requires the [GitHub CLI](https://cli.github.com/), \`gh\`):" \
+            "" \
+            '**macOS / Linux:**' \
+            '```' \
+            "$UNIX_CMD" \
+            '```' \
+            "" \
+            '**Windows (cmd.exe):**' \
+            '```' \
+            "$WIN_CMD" \
+            '```' \
+            > release-notes.md
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TITLE" \
+            --notes-file release-notes.md \
+            $(cat release-assets.txt)

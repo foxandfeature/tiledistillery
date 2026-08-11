@@ -1,0 +1,15 @@
+{
+	"layers": {
+		"place": { "minzoom": 0, "maxzoom": 14 }
+	},
+	"settings": {
+		"minzoom": 0,
+		"maxzoom": 14,
+		"basezoom": 14,
+		"include_ids": false,
+		"name": "TileDistillery CI self-test",
+		"version": "0.1",
+		"description": "Minimal dummy layer used only to exercise the pipeline end to end in CI; not a real consumer config.",
+		"compress": "gzip"
+	}
+}
