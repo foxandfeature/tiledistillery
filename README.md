@@ -35,6 +35,13 @@ jobs:
       attribution: "My Layer — data (c) OpenStreetMap contributors, ODbL"
       # region_scope: "europe/germany"   # optional: restrict to a subtree instead of the whole world
       # worker_count: "20"               # optional: default 20
+      #
+      # Building more than one layer? Pass matching comma-separated lists
+      # instead — one shared .osm.pbf download per region across all of
+      # them (see docs/ARCHITECTURE.md "Multiple layers, one download"):
+      #   config: tiles/bins/config.json,tiles/roads/config.json
+      #   process: tiles/bins/process.lua,tiles/roads/process.lua
+      #   output_basename: bins,roads
 
   publish:
     needs: build
@@ -79,7 +86,7 @@ publishing.
 | `scripts/finalize_check.py` | Compares a run's manifest against claim-ref state; the pre-merge completeness gate. |
 | `scripts/cleanup_claims.py` | Deletes a run's claim refs at the end of `_pipeline.yml`, always. |
 | `scripts/common.py` | Shared GitHub API helpers (ref create/delete/list, Contents API with retry). |
-| `dummy/` | Minimal tilemaker config used only by `ci.yml`; not an example to copy for a real layer. |
+| `dummy/` | Two minimal tilemaker configs used only by `ci.yml` (built together, to exercise the shared-download multi-layer path); not an example to copy for a real layer. |
 
 ## Contributing
 

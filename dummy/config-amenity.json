@@ -1,0 +1,15 @@
+{
+	"layers": {
+		"amenity": { "minzoom": 0, "maxzoom": 14 }
+	},
+	"settings": {
+		"minzoom": 0,
+		"maxzoom": 14,
+		"basezoom": 14,
+		"include_ids": false,
+		"name": "TileDistillery CI self-test (second layer)",
+		"version": "0.1",
+		"description": "Second minimal dummy layer, only to exercise building more than one output_basename together in one _pipeline.yml call (see docs/ARCHITECTURE.md \"Distribution\"). Not a real consumer config.",
+		"compress": "gzip"
+	}
+}

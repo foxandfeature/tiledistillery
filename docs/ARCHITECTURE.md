@@ -55,10 +55,14 @@ region:
 
 1. Fetch the current claim state (see "Locking" below) and the precomputed,
    duration-sorted candidate list (see "Timing history").
-2. Attempt to claim the best remaining candidate.
-3. On success: download that leaf's `.osm.pbf`, run tilemaker, upload the
-   resulting `.mbtiles` as a `shards-<region-id>` artifact, record the
-   claim as done and append this run's duration to the timing history.
+2. Attempt to claim the best remaining candidate — one claim per region,
+   never per `output_basename` (see "Locking" for why that matters when a
+   call builds more than one layer together).
+3. On success: download that leaf's `.osm.pbf` **once**, run tilemaker
+   once per `output_basename` in this call against those same bytes (see
+   "Multiple layers, one download" below), upload each resulting
+   `<region-id>--<output_basename>.mbtiles`, record the claim as done and
+   append this run's duration to the timing history.
 4. Loop back to 1. Exit when no claimable candidate remains, or the job's
    own time budget runs low.
 
@@ -96,7 +100,12 @@ Up to ~20 workers can race to claim the same region. The mechanism is atomic
 git ref creation, one ref per region, under a scope prefix identifying
 *which build* (within this repo) is running:
 `refs/claims/<output_basename>/<region-id>/...` — e.g. a `bins` layer build
-claims `refs/claims/bins/europe/germany/bavaria/...`. Region IDs are
+claims `refs/claims/bins/europe/germany/bavaria/...`, and a call building
+`bins` and `roads` together (see "Multiple layers, one download" below)
+claims `refs/claims/bins,roads/europe/germany/bavaria/...` — the raw input
+value, comma(s) and all, is the scope; it isn't split apart or deduplicated
+against a separate `bins`-only build's own scope, since those really are
+different builds with independent claim/timing history. Region IDs are
 themselves slash-separated Geofabrik paths (e.g. `europe/germany/bavaria`),
 so the whole ref is just nested path segments — a valid git ref name, no
 encoding needed beyond stripping characters git refs disallow.
@@ -180,15 +189,20 @@ construction.
 
 `state/timings/<output_basename>.json` on the caller's state branch (see
 "State branch" below) holds `{ "<region-id>": [last up to 5 durations in
-seconds] }`, appended to by each worker after a successful build. Scoped by
-`output_basename` for the same reason as claims (one repo can build more
-than one layer) and for an additional reason of its own: build time for a
-region is a property of that specific config (how many layers, how much
-Lua work per tag), so two differently-shaped configs need separate
-histories — sharing one would feed each other's durations into an ordering
-estimate that means nothing to them. Unlike claims, this file is *not*
-reset between runs — history is exactly what's meant to persist. The
-`prepare` job sorts the full leaf
+seconds] }`, appended to by each worker after a successful build.
+`<output_basename>` here is the input's raw value, comma(s) and all when
+building more than one layer together (e.g. `state/timings/bins,roads.json`)
+— building `bins,roads` together and calling this pipeline for `bins` alone
+are different scopes with different histories, and that's intentional (see
+below), not an oversight. Scoped this way for the same reason as claims
+(see "Locking") and for an additional reason of its own: build time is a
+property of the *whole set* of configs sharing one download+build pass —
+building `bins` alone takes less time per region than building
+`bins,roads` together, so their histories shouldn't mix, and building
+`bins,roads` together isn't well-modeled as "the sum of bins's own history
+and roads's own history" either, since the download is shared. Unlike
+claims, this file is *not* reset between runs — history is exactly what's
+meant to persist. The `prepare` job sorts the full leaf
 list by mean recorded duration, **longest first**, so the last regions
 claimed near the end of a run are the small ones — the failure mode being
 avoided is one 30-minute outlier (e.g. Russia) still running while every
@@ -213,11 +227,47 @@ point of taking Geofabrik's leaves rather than some coarser level. The
 realistic risk is a handful of workers hitting the time wall near the very
 end of a run while a few regions remain unclaimed — not every worker
 processing a full 6 hours' worth of tiny regions, since the queue simply
-empties once every leaf is claimed. The finalize job (see "Merge") checks
-for exactly this gap and, if a small number of leaves remain, dispatches one
-bounded top-up round (a second, smaller worker matrix) before merging,
-capped at 2 rounds; still-incomplete coverage after that fails the run
-loudly rather than silently publishing a world layer with holes in it.
+empties once every leaf is claimed. `check-complete` (see "Merge") checks
+for exactly this gap and, if regions remain, `topup` dispatches one bounded
+second worker round before `merge`, capped at 2 rounds total; the
+`verify-complete` job fails the run loudly if coverage is still incomplete
+after that, rather than letting `merge` silently publish a world layer with
+holes in it.
+
+## Multiple layers, one download
+
+`config`/`process`/`output_basename` each take one value, or a
+comma-separated list matched 1:1 (e.g. `output_basename: bins,roads`) — the
+same convention TileAlchemist uses for its `profile`/`output_basename`
+inputs, and for the same reason: a region's `.osm.pbf` download is the same
+bytes regardless of which layer is being computed from them, so fetching it
+once and running tilemaker once per config against those bytes, instead of
+once per config *per call*, avoids repeating the one genuinely expensive,
+rate-limit-sensitive part of the work. TileAlchemist's version of this
+(see its `docs/ARCHITECTURE.md` "Parallelism") shares one HTTP range fetch
+across profiles for the same reason; the mechanics differ (a Geofabrik
+`.osm.pbf` download instead of a PMTiles range GET) but the shape of the
+optimization is identical.
+
+Concretely, one claimed region is one *shared* unit of work across every
+`output_basename` in the call: `claim-and-build` (the composite action
+`build`/`topup` both use) downloads the region's `.osm.pbf` once, then
+loops over the config/process/output_basename triples running tilemaker
+against that same file, writing each layer's own
+`<region-id>--<output_basename>.mbtiles`. If any one of those tilemaker
+runs fails, the *whole* region is marked failed and retried as a whole
+(all configs again, not just the one that failed) — regions, not
+individual configs, are the atomic unit of claiming and retrying, which is
+simpler than tracking per-config partial success within one region and
+matches the fact that they already share one claim. Any shard already
+written by an earlier-succeeding config in that same loop is deleted
+before the region is marked failed, so a permanently-failed region can
+never contribute a partial shard to `merge`.
+
+Since the claim is shared but each `output_basename` still needs its own
+final `.pmtiles`, `merge` runs as its own matrix job, one cell per
+`output_basename`, each globbing only its own `*--<output_basename>.mbtiles`
+shards out of every worker's uploaded artifacts.
 
 ## Tile-build engine: tilemaker
 
@@ -269,27 +319,31 @@ complicate every shard's engine now.
 
 ## Merge
 
-The `finalize` job, after the (possibly topped-up) claim-loop completes:
+Three jobs, after the (possibly topped-up) claim-loop completes:
 
-1. Confirms every expected leaf has a `done` claim (or a `failed` one,
-   logged and — depending on how many — either tolerated or treated as a
-   hard failure; exact threshold TBD when this is implemented, not an
-   architectural question).
-2. Downloads every `shards-*` artifact.
-3. Runs one flat `tile-join --no-tile-size-limit --attribution=... -o
-   <output_basename>.pmtiles shards/*.mbtiles` — deliberately a single
-   merge step, not staged-by-continent-then-globally, exactly like
-   TileAlchemist's own merge job. A hierarchical merge would mean writing
-   most tiles twice (once per continent, again in the final pass) and adds
-   real complexity for a problem that doesn't exist yet; only revisit if
-   the flat merge's memory/time in that one job actually becomes a bottleneck.
-4. Uploads `<output_basename>-pmtiles` as a workflow artifact — pipeline
-   still does not publish anywhere itself, same separation of concerns as
-   TileAlchemist's `_pipeline.yml`.
-5. Deletes every ref under this run's `refs/claims/<output_basename>/` scope
-   (logging any `failed` ones first) with `if: always()`, so the next run
-   of the same build starts with an empty claim namespace regardless of how
-   this one ended.
+1. **`verify-complete`**, once per run regardless of how many
+   `output_basename`s are being built (completeness is a property of
+   *regions*, which are claimed once across the whole call — see "Multiple
+   layers, one download"): confirms every expected leaf has a `done` claim
+   (or a `failed` one, logged and — depending on how many — either
+   tolerated or treated as a hard failure; exact threshold TBD when this is
+   implemented, not an architectural question).
+2. **`merge`**, matrixed one cell per `output_basename`: downloads every
+   `shards-*` artifact, then runs one flat `tile-join
+   --no-tile-size-limit --attribution=... -o <output_basename>.pmtiles
+   shards/*--<output_basename>.mbtiles` for its own cell's basename —
+   deliberately a single merge step, not staged-by-continent-then-globally,
+   exactly like TileAlchemist's own merge job. A hierarchical merge would
+   mean writing most tiles twice (once per continent, again in the final
+   pass) and adds real complexity for a problem that doesn't exist yet;
+   only revisit if the flat merge's memory/time in that one job actually
+   becomes a bottleneck. Uploads `<output_basename>-pmtiles` as a workflow
+   artifact — pipeline still does not publish anywhere itself, same
+   separation of concerns as TileAlchemist's `_pipeline.yml`.
+3. **`cleanup`**, `if: always()`: deletes every ref under this run's
+   `refs/claims/<output_basename>/` scope (logging any `failed` ones
+   first), so the next run of the same build starts with an empty claim
+   namespace regardless of how this one ended.
 
 ## State branch
 
@@ -349,10 +403,13 @@ number against.
 
 `_pipeline.yml` (`on: workflow_call`) inputs:
 
-- `config`, `process` — paths in the *caller's* repo to the tilemaker JSON
-  config and Lua process script.
-- `output_basename`, `attribution` — required, same meaning as
-  TileAlchemist's.
+- `config`, `process` — path(s) in the *caller's* repo to the tilemaker
+  JSON config(s) and Lua process script(s): one value each, or a
+  comma-separated list matched 1:1 with `output_basename` — see "Multiple
+  layers, one download".
+- `output_basename` — required, one value or a comma-separated list
+  matched 1:1 with `config`/`process`.
+- `attribution` — required, one value applied to every layer in the call.
 - `worker_count` — default ~20 (see "Distribution").
 - `region_scope` — optional Geofabrik path prefix filter (e.g.
   `europe/monaco`); default empty = every leaf, whole world. Exists so a
@@ -381,13 +438,16 @@ own schedule).
 
 ## CI self-test
 
-This repo's own caller workflow (`.github/workflows/ci.yml` or similar)
-exercises the full pipeline on a minimal dummy tilemaker config — no
-domain-specific layer, just enough to prove config-referencing, sharding,
-claiming, and merge work end to end — scoped via `region_scope` to
-something tiny (e.g. `europe/monaco` or `europe/vatican-city`) so PR CI
-doesn't attempt a full-world build. The first real consumer,
-`trashtracker-tiles`, is a separate, later, out-of-scope repo.
+This repo's own caller workflow (`.github/workflows/ci.yml`) exercises the
+full pipeline on two minimal dummy tilemaker configs *built together in one
+call* — no domain-specific layers, just enough to prove config-referencing,
+sharding, claiming, and merge work end to end, and specifically that the
+comma-separated `config`/`process`/`output_basename` path (see "Multiple
+layers, one download") produces two independent `<output_basename>.pmtiles`
+outputs from one shared download per region. Scoped via `region_scope` to
+something tiny (e.g. `europe/monaco`) so PR CI doesn't attempt a
+full-world build. The first real consumer, `trashtracker-tiles`, is a
+separate, later, out-of-scope repo.
 
 ## Deliberately deferred
 

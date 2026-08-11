@@ -6,15 +6,21 @@ description: >
   queue is exhausted or this job runs low on time. Used identically by
   _pipeline.yml's main build round and its top-up round. Assumes the caller
   repo is already checked out at the workspace root and this pipeline's own
-  repo under `.tiledistillery/`.
+  repo under `.tiledistillery/`. config/process/output_basename take one
+  value each, or comma-separated lists matched 1:1 — building more than one
+  layer this way claims a region once and downloads its .osm.pbf once,
+  running tilemaker once per config against those same bytes (see
+  docs/ARCHITECTURE.md "Distribution", the same optimization TileAlchemist
+  applies to its own multi-profile runs).
 inputs:
   config:
-    description: Path, in the caller repo, to the tilemaker JSON layer config.
+    description: 'Path(s), in the caller repo, to tilemaker JSON layer config(s): one value, or a comma-separated list matched 1:1 with process/output_basename.'
     required: true
   process:
-    description: Path, in the caller repo, to the tilemaker Lua process script.
+    description: 'Path(s), in the caller repo, to tilemaker Lua process script(s), matched 1:1 with config/output_basename.'
     required: true
   output_basename:
+    description: 'Base name(s) for the output .pmtiles file(s), matched 1:1 with config/process. Also the claim/timing-history scope key, taken verbatim — see docs/ARCHITECTURE.md "Locking".'
     required: true
   manifest:
     description: Path to the queue-manifest.json produced by the prepare job.
@@ -57,14 +63,21 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        CONFIG: ${{ inputs.config }}
+        PROCESS: ${{ inputs.process }}
+        OUTPUT_BASENAME: ${{ inputs.output_basename }}
       run: |
         set -euo pipefail
         mkdir -p "${{ inputs.shards_dir }}"
 
+        IFS=',' read -ra CONFIGS <<< "$CONFIG"
+        IFS=',' read -ra PROCESSES <<< "$PROCESS"
+        IFS=',' read -ra BASENAMES <<< "$OUTPUT_BASENAME"
+
         while true; do
           CLAIM_JSON=$(python .tiledistillery/scripts/claim.py next \
             --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
-            --state-branch state --output-basename "${{ inputs.output_basename }}" \
+            --state-branch state --output-basename "$OUTPUT_BASENAME" \
             --manifest "${{ inputs.manifest }}" --ttl-seconds "${{ inputs.ttl_seconds }}")
 
           CLAIMED=$(jq -r '.claimed' <<<"$CLAIM_JSON")
@@ -76,33 +89,56 @@ runs:
           REGION_ID=$(jq -r '.region.id' <<<"$CLAIM_JSON")
           PBF_URL=$(jq -r '.region.pbf_url' <<<"$CLAIM_JSON")
           SAFE_NAME=$(tr '/' '_' <<<"$REGION_ID")
-          STORE_DIR="$(mktemp -d)"
 
           echo "::group::${REGION_ID}"
           START=$(date +%s)
           set +e
-          curl -fsSL "$PBF_URL" -o region.osm.pbf \
-            && tilemaker --input region.osm.pbf \
-                 --output "${{ inputs.shards_dir }}/${SAFE_NAME}.mbtiles" \
-                 --config "${{ inputs.config }}" --process "${{ inputs.process }}" \
-                 --store "$STORE_DIR"
+          curl -fsSL "$PBF_URL" -o region.osm.pbf
           STATUS=$?
+
+          # One fetch, every requested layer built against the same bytes
+          # (see docs/ARCHITECTURE.md "Distribution" — the same fetch/build
+          # split TileAlchemist uses for its own multi-profile runs). Each
+          # config gets its own shard file, "<region>--<output_basename>.mbtiles",
+          # so the merge job can later glob for just its own layer's shards.
+          if [ "$STATUS" -eq 0 ]; then
+            for i in "${!BASENAMES[@]}"; do
+              STORE_DIR="$(mktemp -d)"
+              tilemaker --input region.osm.pbf \
+                --output "${{ inputs.shards_dir }}/${SAFE_NAME}--${BASENAMES[$i]}.mbtiles" \
+                --config "${CONFIGS[$i]}" --process "${PROCESSES[$i]}" \
+                --store "$STORE_DIR"
+              STATUS=$?
+              rm -rf "$STORE_DIR"
+              if [ "$STATUS" -ne 0 ]; then
+                break
+              fi
+            done
+          fi
           set -e
           rm -f region.osm.pbf
-          rm -rf "$STORE_DIR"
           END=$(date +%s)
           echo "::endgroup::"
 
           if [ "$STATUS" -eq 0 ]; then
             python .tiledistillery/scripts/claim.py done \
               --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
-              --state-branch state --output-basename "${{ inputs.output_basename }}" \
+              --state-branch state --output-basename "$OUTPUT_BASENAME" \
               --region-id "$REGION_ID" \
               --duration-seconds "$((END - START))"
           else
+            # A region is one atomic unit of work across every config built
+            # together in this call: if any of them failed, the whole
+            # region is retried (all configs again) rather than tracking
+            # partial per-config success — simpler, and consistent with
+            # regions (not configs) being the thing that gets claimed. Any
+            # shard already written by a config that succeeded before a
+            # later one failed must not survive into the shards artifact,
+            # since this region is about to be marked failed, not done.
+            rm -f "${{ inputs.shards_dir }}/${SAFE_NAME}--"*.mbtiles
             python .tiledistillery/scripts/claim.py failed \
               --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
-              --state-branch state --output-basename "${{ inputs.output_basename }}" \
+              --state-branch state --output-basename "$OUTPUT_BASENAME" \
               --region-id "$REGION_ID" \
               --error "build failed (exit ${STATUS})"
           fi

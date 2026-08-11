@@ -1,12 +1,18 @@
 name: TileDistillery pipeline (reusable)
 
-# Builds one PMTiles layer from every Geofabrik leaf extract in scope,
-# using the caller's own tilemaker config/process files (see
-# docs/ARCHITECTURE.md). prepare -> build (claim-loop matrix) ->
-# check-complete -> topup (conditional second claim-loop round) ->
-# finalize (verify + merge) -> cleanup (always). Deliberately does NOT
-# publish anywhere (no GitHub Release, no B2 upload) — that's the calling
-# workflow's job, same separation as TileAlchemist's _pipeline.yml.
+# Builds one or more PMTiles layers from every Geofabrik leaf extract in
+# scope, using the caller's own tilemaker config/process files (see
+# docs/ARCHITECTURE.md). config/process/output_basename each take one
+# value, or a comma-separated list matched 1:1 (e.g. building "bins" and
+# "roads" together) — sharing one claim and one .osm.pbf download per
+# region across every config in the list, same fetch/build split
+# TileAlchemist uses for its own multi-profile runs.
+#
+# prepare -> build (claim-loop matrix) -> check-complete -> topup
+# (conditional second claim-loop round) -> verify-complete (hard gate) ->
+# merge (matrixed per output_basename) -> cleanup (always). Deliberately
+# does NOT publish anywhere (no GitHub Release, no B2 upload) — that's the
+# calling workflow's job, same separation as TileAlchemist's _pipeline.yml.
 #
 # State (claim refs + timing history) lives on the CALLING repo's own
 # `state` branch, never in this repo — see docs/ARCHITECTURE.md "State
@@ -15,24 +21,27 @@ name: TileDistillery pipeline (reusable)
 # below (keyed by caller repo + output_basename) is what actually prevents
 # two overlapping runs of the same build from racing over the same claim
 # scope, so the caller does not need its own concurrency group for that.
+# Calling this pipeline for "bins,roads" together and calling it separately
+# for "bins" alone are different scopes/claim histories — see
+# docs/ARCHITECTURE.md "Locking".
 
 on:
   workflow_call:
     inputs:
       config:
-        description: 'Path, in the caller repo, to the tilemaker JSON layer config.'
+        description: 'Path(s), in the caller repo, to tilemaker JSON layer config(s): one value, or a comma-separated list matched 1:1 with process/output_basename.'
         required: true
         type: string
       process:
-        description: 'Path, in the caller repo, to the tilemaker Lua process script.'
+        description: 'Path(s), in the caller repo, to tilemaker Lua process script(s), matched 1:1 with config/output_basename.'
         required: true
         type: string
       output_basename:
-        description: 'Base name for the output .pmtiles file/artifact, and the scope key for this build''s claims/timing history.'
+        description: 'Base name(s) for each output .pmtiles file/artifact, matched 1:1 with config/process, e.g. "bins" or "bins,roads". Also the scope key for claims/timing history — see docs/ARCHITECTURE.md "Locking".'
         required: true
         type: string
       attribution:
-        description: 'HTML attribution string embedded in the merged PMTiles metadata via tile-join --attribution.'
+        description: 'HTML attribution string embedded in every output layer''s PMTiles metadata via tile-join --attribution, applied uniformly across the whole config/process/output_basename list.'
         required: true
         type: string
       worker_count:
@@ -57,7 +66,22 @@ jobs:
       contents: write
     outputs:
       workers: ${{ steps.gen-workers.outputs.workers }}
+      basenames: ${{ steps.gen-basenames.outputs.basenames }}
     steps:
+      - name: Validate config/process/output_basename line up 1:1
+        env:
+          CONFIG: ${{ inputs.config }}
+          PROCESS: ${{ inputs.process }}
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: |
+          IFS=',' read -ra C <<< "$CONFIG"
+          IFS=',' read -ra P <<< "$PROCESS"
+          IFS=',' read -ra B <<< "$OUTPUT_BASENAME"
+          if [ "${#C[@]}" -ne "${#P[@]}" ] || [ "${#C[@]}" -ne "${#B[@]}" ]; then
+            echo "::error::config has ${#C[@]} entries, process has ${#P[@]}, output_basename has ${#B[@]}; must match 1:1"
+            exit 1
+          fi
+
       - name: Checkout tiledistillery (this pipeline's own scripts)
         uses: actions/checkout@v4
         with:
@@ -90,6 +114,11 @@ jobs:
         env:
           WORKER_COUNT: ${{ inputs.worker_count }}
         run: echo "workers=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["WORKER_COUNT"])))))')" >> "$GITHUB_OUTPUT"
+
+      - id: gen-basenames
+        env:
+          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        run: echo "basenames=$(python3 -c 'import json, os; print(json.dumps(os.environ["OUTPUT_BASENAME"].split(",")))')" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -206,7 +235,13 @@ jobs:
           path: shards/*.mbtiles
           if-no-files-found: ignore
 
-  finalize:
+  # The hard gate, run once regardless of how many output_basenames are
+  # being built together — completeness is a property of *regions*, which
+  # are claimed once per call, not per output_basename (see
+  # docs/ARCHITECTURE.md "Locking"). Fails loudly rather than letting
+  # `merge` silently publish a world layer with holes in it (see
+  # docs/ARCHITECTURE.md "Merge").
+  verify-complete:
     needs: [check-complete, topup]
     if: always()
     runs-on: ubuntu-latest
@@ -230,8 +265,6 @@ jobs:
         with:
           name: queue-manifest
 
-      # The real gate: fails loudly rather than silently publishing a
-      # world layer with holes in it (see docs/ARCHITECTURE.md "Merge").
       - name: Confirm every region is done or permanently failed
         env:
           GH_TOKEN: ${{ github.token }}
@@ -241,7 +274,21 @@ jobs:
             --state-branch state --output-basename "${{ inputs.output_basename }}" \
             --manifest queue-manifest.json --fail-if-incomplete
 
-      - name: Download every worker's shards (both rounds)
+  # One flat merge per output_basename, deliberately not staged by
+  # continent — see docs/ARCHITECTURE.md "Merge". Each worker already
+  # wrote its shards as "<region>--<output_basename>.mbtiles" (see
+  # claim-and-build), so this only needs to glob for its own matrix cell's
+  # basename among every downloaded shard, shared across every layer built
+  # in this call.
+  merge:
+    needs: [prepare, verify-complete]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        basename: ${{ fromJson(needs.prepare.outputs.basenames) }}
+    steps:
+      - name: Download every worker's shards (both rounds, every layer)
         uses: actions/download-artifact@v4
         with:
           pattern: shards-*
@@ -257,36 +304,34 @@ jobs:
             sudo make -C /tmp/tippecanoe install
           }
 
-      # One flat merge, deliberately not staged by continent — see
-      # docs/ARCHITECTURE.md "Merge".
-      - name: Merge every shard into the final layer
+      - name: Merge this layer's shards into its final file
         env:
           ATTRIBUTION: ${{ inputs.attribution }}
-          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+          BASENAME: ${{ matrix.basename }}
         run: |
           tile-join --no-tile-size-limit \
             --attribution="$ATTRIBUTION" \
-            -o "${OUTPUT_BASENAME}.pmtiles" shards/*.mbtiles
+            -o "${BASENAME}.pmtiles" shards/*--"${BASENAME}".mbtiles
 
       - name: Summarize
         env:
-          OUTPUT_BASENAME: ${{ inputs.output_basename }}
+          BASENAME: ${{ matrix.basename }}
         run: |
-          SHARD_COUNT=$(find shards -name '*.mbtiles' | wc -l | tr -d ' ')
-          SIZE=$(du -h "${OUTPUT_BASENAME}.pmtiles" | cut -f1)
+          SHARD_COUNT=$(find shards -name "*--${BASENAME}.mbtiles" | wc -l | tr -d ' ')
+          SIZE=$(du -h "${BASENAME}.pmtiles" | cut -f1)
           {
-            echo "### ${OUTPUT_BASENAME} layer"
+            echo "### ${BASENAME} layer"
             echo "- shards merged: $SHARD_COUNT"
             echo "- output size: $SIZE"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.output_basename }}-pmtiles
-          path: ${{ inputs.output_basename }}.pmtiles
+          name: ${{ matrix.basename }}-pmtiles
+          path: ${{ matrix.basename }}.pmtiles
 
   cleanup:
-    needs: [check-complete, topup, finalize]
+    needs: [check-complete, topup, verify-complete, merge]
     if: always()
     runs-on: ubuntu-latest
     permissions:
