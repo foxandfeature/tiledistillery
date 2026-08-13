@@ -3,7 +3,10 @@
 repository's own `state` branch, run with `if: always()` at the end of
 `_pipeline.yml` so the next run of the same build starts clean (see
 docs/ARCHITECTURE.md "Locking" — claims are deliberately not run-ID-scoped,
-so this is what actually resets state between runs)."""
+so this is what actually resets state between runs). Best effort: a ref
+that fails to delete (for example a persistent GitHub API error) is logged
+and skipped instead of aborting the rest of the cleanup, since a later
+run's cleanup will pick it up again from a fresh `list_matching_refs`."""
 
 import argparse
 import sys
@@ -28,10 +31,17 @@ def main():
         for r in failed:
             print(f"::warning::  {r}", file=sys.stderr)
 
+    skipped = []
     for ref in refs:
-        common.delete_ref(args.repo, args.token, ref[len("refs/"):])
+        try:
+            common.delete_ref(args.repo, args.token, ref[len("refs/"):])
+        except Exception as exc:
+            skipped.append(ref)
+            print(f"::warning::failed to delete {ref}: {exc}", file=sys.stderr)
 
-    print(f"cleaned up {len(refs)} claim ref(s) under {scope!r}", file=sys.stderr)
+    print(f"cleaned up {len(refs) - len(skipped)}/{len(refs)} claim ref(s) under {scope!r}", file=sys.stderr)
+    if skipped:
+        print(f"::warning::{len(skipped)} claim ref(s) left behind under {scope!r}; a later cleanup run will retry them", file=sys.stderr)
 
 
 if __name__ == "__main__":
