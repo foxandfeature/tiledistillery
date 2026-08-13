@@ -11,6 +11,7 @@ git ref / artifact name.
 """
 
 import argparse
+import concurrent.futures
 import json
 import statistics
 import sys
@@ -69,6 +70,18 @@ def pbf_size(url):
     return int(length) if length is not None else 0
 
 
+def fetch_pbf_sizes(urls, max_workers=16):
+    """Parallel HEAD requests for leaves with no timing history yet. On a
+    fresh run (empty timings.json) this is hundreds of leaves, and doing
+    them one at a time was the dominant cost of building the manifest."""
+    sizes = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_url = {pool.submit(pbf_size, url): url for url in set(urls)}
+        for future in concurrent.futures.as_completed(future_to_url):
+            sizes[future_to_url[future]] = future.result()
+    return sizes
+
+
 def timings_path(output_basename):
     return f"state/timings/{output_basename}.json"
 
@@ -80,7 +93,7 @@ def build_manifest(region_scope, repo, token, state_branch, output_basename):
 
     timings, _ = common.get_json_file(repo, token, state_branch, timings_path(output_basename))
 
-    regions = []
+    candidates = []
     for feature in leaves:
         props = feature["properties"]
         path = paths[props["id"]]
@@ -90,8 +103,12 @@ def build_manifest(region_scope, repo, token, state_branch, output_basename):
         if not pbf_url:
             print(f"::warning::skipping {path!r}: no .osm.pbf URL in Geofabrik index", file=sys.stderr)
             continue
+        candidates.append((path, pbf_url, timings.get(path) or []))
 
-        durations = timings.get(path) or []
+    sizes = fetch_pbf_sizes(pbf_url for _, pbf_url, durations in candidates if not durations)
+
+    regions = []
+    for path, pbf_url, durations in candidates:
         if durations:
             regions.append({
                 "id": path,
@@ -104,7 +121,7 @@ def build_manifest(region_scope, repo, token, state_branch, output_basename):
                 "id": path,
                 "pbf_url": pbf_url,
                 "has_history": False,
-                "sort_metric": pbf_size(pbf_url),
+                "sort_metric": sizes[pbf_url],
             })
 
     # Primary: known timing history sorts before size-only estimates (see
