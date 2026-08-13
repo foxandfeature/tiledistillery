@@ -9,7 +9,7 @@
 function node_function(node)
 	local place = Find("place")
 	if place ~= "" then
-		Layer("place")
+		Layer("place", false)
 		Attribute("class", place)
 		Attribute("name", Find("name"))
 	end

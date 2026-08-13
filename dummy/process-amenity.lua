@@ -7,7 +7,7 @@
 function node_function(node)
 	local amenity = Find("amenity")
 	if amenity ~= "" then
-		Layer("amenity")
+		Layer("amenity", false)
 		Attribute("class", amenity)
 		Attribute("name", Find("name"))
 	end

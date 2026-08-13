@@ -33,6 +33,28 @@ def _headers(token):
     }
 
 
+class TokenPermissionError(RuntimeError):
+    """A 403 that isn't GitHub's secondary-rate-limit signal — the token
+    itself lacks the needed scope, so retrying only wastes _MAX_RETRIES
+    rounds of backoff before failing anyway. Raised immediately instead."""
+
+
+def _permission_denied_message(resp):
+    """None if this 403 is (or might be) a retryable secondary rate limit;
+    otherwise the GitHub error message, for a message that explains what to
+    fix instead of a bare HTTPError. GitHub's secondary-rate-limit 403s
+    always mention 'rate limit' in the message; permission-denied 403s
+    ('Resource not accessible by integration', missing/insufficient scopes)
+    never do, and no amount of retrying fixes them."""
+    try:
+        message = resp.json().get("message", "")
+    except ValueError:
+        return None
+    if "rate limit" in message.lower():
+        return None
+    return message
+
+
 def _request(method, path, token, **kwargs):
     url = f"{API_BASE}{path}"
     last_exc = None
@@ -43,6 +65,16 @@ def _request(method, path, token, **kwargs):
             last_exc = exc
             time.sleep(_BACKOFF_BASE_S * (2 ** attempt))
             continue
+        if resp.status_code == 403:
+            message = _permission_denied_message(resp)
+            if message is not None:
+                raise TokenPermissionError(
+                    f"GitHub rejected {method} {path} as 403 Forbidden: {message!r}. "
+                    "This is a token-permission problem, not a rate limit, so retrying "
+                    "won't help: the calling workflow must grant "
+                    "`permissions: contents: write` (see docs/ARCHITECTURE.md "
+                    "'State lives in the caller's repo, not this one')."
+                )
         if resp.status_code in (403, 429) or resp.status_code >= 500:
             time.sleep(_BACKOFF_BASE_S * (2 ** attempt))
             continue
