@@ -189,7 +189,20 @@ construction.
 
 `state/timings/<output_basename>.json` on the caller's state branch (see
 "State branch" below) holds `{ "<region-id>": [last up to 5 durations in
-seconds] }`, appended to by each worker after a successful build.
+seconds] }`. Each worker buffers its own regions' durations locally
+(`claim.py done --timings-buffer`) and merges its whole buffer into this
+shared file in one write at the end of its run (`claim.py flush-timings`,
+triggered by a trap in `claim-and-build/action.yml` so it fires however the
+worker's loop ends), rather than writing this file on every single `done` —
+see `cmd_done`'s docstring in `scripts/claim.py` for why: with
+`worker_count` workers each claiming tens of regions, a write per region
+turns this single shared file into a hot lock that plausibly exhausts
+`update_json_file_with_retry`'s attempts, which used to be a fatal error
+able to kill an otherwise-healthy worker's claim loop mid-run. Batching to
+one write per worker cuts the collision rate on this file by roughly the
+average regions-per-worker count, which is what keeps this
+shared-file-with-retry approach viable at this concurrency, not just a
+smaller blast radius when it fails.
 `<output_basename>` here is the input's raw value, comma(s) and all when
 building more than one layer together (e.g. `state/timings/bins,roads.json`)
 — building `bins,roads` together and calling this pipeline for `bins` alone

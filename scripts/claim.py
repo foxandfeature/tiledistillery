@@ -11,9 +11,15 @@ is always enough to reconstruct it.
 
 Subcommands, each printing one JSON object to stdout:
 
-    claim.py next   --manifest queue-manifest.json ...   -> {"claimed": bool, "region": {...}|null}
-    claim.py done   --region-id X --duration-seconds N ...
-    claim.py failed --region-id X [--error MSG] ...       -> {"permanently_failed": bool, "attempt": int}
+    claim.py next          --manifest queue-manifest.json ...        -> {"claimed": bool, "region": {...}|null}
+    claim.py done          --region-id X --duration-seconds N ...
+    claim.py failed        --region-id X [--error MSG] ...           -> {"permanently_failed": bool, "attempt": int}
+    claim.py flush-timings --timings-buffer PATH ...                 -> {"flushed": int}
+
+`done` buffers its duration locally (--timings-buffer) rather than writing
+the shared timing-history file itself; `flush-timings` merges one worker's
+whole buffer into that shared file in a single call. See cmd_done's
+docstring for why.
 """
 
 import argparse
@@ -177,19 +183,72 @@ def cmd_done(args):
     if ts is not None:
         common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock-at/{ts}")
 
-    def append_duration(timings):
-        history = timings.get(args.region_id, [])
-        history = (history + [args.duration_seconds])[-5:]
-        timings[args.region_id] = history
+    # Duration goes to a local, per-worker file, not straight to the shared
+    # state/timings/<output_basename>.json — a worker claims tens of regions
+    # in a row, and this shared file is the one piece of per-region state
+    # *not* keyed by its own ref (unlike the claim/done/failed refs above),
+    # so writing it here on every single `done` turns it into a hot lock:
+    # `worker_count` workers finishing regions close together all race the
+    # same read-modify-write, and under a full fan-out that can exhaust
+    # update_json_file_with_retry's attempts outright. Appending to a local
+    # file is a pure filesystem write — no network round trip, so it can't
+    # collide with anything. cmd_flush_timings merges the whole buffer in
+    # one shared-file write per worker instead of one per region; see its
+    # docstring.
+    with open(args.timings_buffer, "a") as f:
+        f.write(json.dumps({"region_id": args.region_id, "duration_seconds": args.duration_seconds}) + "\n")
+
+    print(json.dumps({"ok": True}))
+
+
+def cmd_flush_timings(args):
+    """Merges this worker's locally buffered durations (from repeated
+    cmd_done calls, one line each) into the shared timing-history file in a
+    single read-modify-write, however many regions this worker built —
+    called once, at the end of a worker's claim loop (see
+    claim-and-build/action.yml). Cuts the write rate on that shared file
+    from "once per region" to "once per worker", which is what actually
+    fixes the contention (see cmd_done), not just tolerates it.
+
+    Still best-effort: a worker's one flush can in principle still collide
+    with another worker's own flush landing at the same moment, and
+    update_json_file_with_retry can still exhaust its attempts. Losing a
+    batch of timing samples is fine — regions with no recorded history just
+    fall back to byte-size ordering (see docs/ARCHITECTURE.md "Timing
+    history & queue ordering") — so a failure here is logged and swallowed
+    rather than raised, same reasoning as sweep_stale: raising would be a
+    worse outcome (this is typically called at the very end of a worker's
+    run, but claim-and-build also flushes via a trap on any early exit, so
+    a raise here could still abort a loop that has more regions left to
+    claim). Safe to call with a buffer file that's missing or empty."""
+    try:
+        with open(args.timings_buffer) as f:
+            lines = [line for line in f if line.strip()]
+    except FileNotFoundError:
+        lines = []
+    if not lines:
+        print(json.dumps({"flushed": 0}))
+        return
+
+    entries = [json.loads(line) for line in lines]
+
+    def apply_batch(timings):
+        for entry in entries:
+            history = timings.get(entry["region_id"], [])
+            history = (history + [entry["duration_seconds"]])[-5:]
+            timings[entry["region_id"]] = history
         return timings
 
-    common.update_json_file_with_retry(
-        args.repo, args.token, args.state_branch,
-        leaves.timings_path(args.output_basename),
-        append_duration,
-        message=f"record timing for {args.region_id}",
-    )
-    print(json.dumps({"ok": True}))
+    try:
+        common.update_json_file_with_retry(
+            args.repo, args.token, args.state_branch,
+            leaves.timings_path(args.output_basename),
+            apply_batch,
+            message=f"record timing for {len(entries)} region(s)",
+        )
+    except RuntimeError as exc:
+        print(f"::warning::timing history flush failed for {len(entries)} region(s): {exc}", file=sys.stderr)
+    print(json.dumps({"flushed": len(entries)}))
 
 
 def cmd_failed(args):
@@ -226,6 +285,7 @@ def main():
     _add_common_args(p_done)
     p_done.add_argument("--region-id", required=True)
     p_done.add_argument("--duration-seconds", type=int, required=True)
+    p_done.add_argument("--timings-buffer", required=True, help="Local file this worker's durations are appended to; see cmd_flush_timings.")
     p_done.set_defaults(func=cmd_done)
 
     p_failed = sub.add_parser("failed")
@@ -233,6 +293,11 @@ def main():
     p_failed.add_argument("--region-id", required=True)
     p_failed.add_argument("--error", default="")
     p_failed.set_defaults(func=cmd_failed)
+
+    p_flush = sub.add_parser("flush-timings")
+    _add_common_args(p_flush)
+    p_flush.add_argument("--timings-buffer", required=True)
+    p_flush.set_defaults(func=cmd_flush_timings)
 
     args = parser.parse_args()
     args.func(args)

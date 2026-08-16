@@ -76,6 +76,23 @@ runs:
         IFS=',' read -ra PROCESSES <<< "$PROCESS"
         IFS=',' read -ra BASENAMES <<< "$OUTPUT_BASENAME"
 
+        # `claim.py done` only appends this worker's durations here, locally
+        # (see its docstring for why writing the shared timing-history file
+        # once per region — rather than once per worker — turns it into a
+        # hot lock under a full worker fan-out). The trap flushes the whole
+        # buffer in one shared-file write, and fires on every way this
+        # script can end (queue-empty break below, or `set -e` on an
+        # unexpected error further down) so a worker's timing data isn't
+        # lost just because it stopped partway through the queue.
+        TIMINGS_BUFFER="$(mktemp)"
+        flush_timings() {
+          python .tiledistillery/scripts/claim.py flush-timings \
+            --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+            --state-branch state --output-basename "$OUTPUT_BASENAME" \
+            --timings-buffer "$TIMINGS_BUFFER" || true
+        }
+        trap flush_timings EXIT
+
         while true; do
           CLAIM_JSON=$(python .tiledistillery/scripts/claim.py next \
             --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
@@ -134,7 +151,8 @@ runs:
               --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
               --state-branch state --output-basename "$OUTPUT_BASENAME" \
               --region-id "$REGION_ID" \
-              --duration-seconds "$((END - START))"
+              --duration-seconds "$((END - START))" \
+              --timings-buffer "$TIMINGS_BUFFER"
           else
             # A region is one atomic unit of work across every config built
             # together in this call: if any of them failed, the whole
