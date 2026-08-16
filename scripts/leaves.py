@@ -29,6 +29,39 @@ def fetch_index():
     return resp.json()["features"]
 
 
+# Geofabrik regional bundles that overlap finer extracts already covered
+# elsewhere in the tree, but whose `parent` field doesn't say so (see
+# effective_parent below for the general case this doesn't catch): these
+# US Census-region groupings (id, declared parent "north-america") sit
+# geographically on top of the individual `us/<state>` extracts, which
+# are also independent leaves — download-only convenience bundles Geofabrik
+# offers alongside the finer split, not a coarser tier of the same tree.
+# Nothing in the index marks that redundancy, so it's hardcoded here.
+KNOWN_REDUNDANT_LEAVES = {
+    "us-midwest", "us-northeast", "us-pacific", "us-south", "us-west",
+}
+
+
+def effective_parent(gid, by_id):
+    """Geofabrik's `parent` field is supposed to encode the containment
+    tree find_leaves() relies on, but for every `us/<state>` extract it
+    points straight at "north-america" instead of "us" — even though the
+    id itself already encodes that nesting with a literal "/". Trusting
+    `parent` there makes "us" (whole country) look like a leaf alongside
+    every state that's actually inside it, double-covering the whole US.
+    Where an id's own slash-prefix names another real feature, treat that
+    as the true parent instead of the declared one; otherwise fall back to
+    `parent` as normal (this is a data quirk isolated to the `us/*` branch
+    today, not a general Geofabrik convention, so it only ever overrides
+    anything for ids shaped like that).
+    """
+    if "/" in gid:
+        prefix = gid.rsplit("/", 1)[0]
+        if prefix in by_id:
+            return prefix
+    return by_id[gid].get("parent")
+
+
 def compute_paths(features):
     """Returns {geofabrik_id: full/slash/path}."""
     by_id = {f["properties"]["id"]: f["properties"] for f in features}
@@ -41,8 +74,14 @@ def compute_paths(features):
         if gid in _seen:
             raise ValueError(f"cycle in Geofabrik parent chain at {gid!r}")
         _seen.add(gid)
-        parent = by_id[gid].get("parent")
-        result = f"{path_of(parent, _seen)}/{gid}" if parent else gid
+        parent = effective_parent(gid, by_id)
+        # When the parent came from gid's own slash-prefix (see
+        # effective_parent), gid already spells out that prefix itself
+        # (e.g. "us/wisconsin"'s effective parent is "us") — append only
+        # the part after it, or the parent's path would be duplicated
+        # into the result ("north-america/us/us/wisconsin").
+        local = gid[len(parent) + 1:] if parent and gid.startswith(parent + "/") else gid
+        result = f"{path_of(parent, _seen)}/{local}" if parent else gid
         paths[gid] = result
         return result
 
@@ -52,8 +91,13 @@ def compute_paths(features):
 
 
 def find_leaves(features):
-    parents_referenced = {f["properties"].get("parent") for f in features}
-    return [f for f in features if f["properties"]["id"] not in parents_referenced]
+    by_id = {f["properties"]["id"]: f["properties"] for f in features}
+    parents_referenced = {effective_parent(gid, by_id) for gid in by_id}
+    return [
+        f for f in features
+        if f["properties"]["id"] not in parents_referenced
+        and f["properties"]["id"] not in KNOWN_REDUNDANT_LEAVES
+    ]
 
 
 def in_scope(path, region_scope):

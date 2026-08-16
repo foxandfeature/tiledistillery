@@ -1,7 +1,7 @@
 name: 'Claim and build Geofabrik regions'
 description: >
-  Installs tilemaker and this pipeline's own scripts, then loops claiming
-  leaf regions from the shared queue (see docs/ARCHITECTURE.md
+  Pulls the tilemaker image and this pipeline's own scripts, then loops
+  claiming leaf regions from the shared queue (see docs/ARCHITECTURE.md
   "Distribution" and "Locking") and building each with tilemaker, until the
   queue is exhausted or this job runs low on time. Used identically by
   _pipeline.yml's main build round and its top-up round. Assumes the caller
@@ -45,19 +45,21 @@ runs:
       shell: bash
       run: pip install -r .tiledistillery/scripts/requirements.txt
 
-    - name: Install tilemaker
+    - name: Pull tilemaker image
       shell: bash
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y tilemaker || {
-          echo "::warning::tilemaker not available via apt, building from source"
-          sudo apt-get install -y build-essential libboost-dev libboost-filesystem-dev \
-            libboost-program-options-dev libboost-system-dev lua5.3 liblua5.3-dev \
-            libshp-dev libsqlite3-dev rapidjson-dev
-          git clone --depth 1 https://github.com/systemed/tilemaker.git /tmp/tilemaker-src
-          make -C /tmp/tilemaker-src -j"$(nproc)"
-          sudo make -C /tmp/tilemaker-src install
-        }
+      # ghcr.io/systemed/tilemaker is the project's own published image —
+      # current tilemaker, not whatever's frozen in Ubuntu's universe repo
+      # (Noble ships 2.4.0, pre-3.0's Lua API and missing since-fixed
+      # crashes; see the incident that prompted this switch). ":master" is
+      # the only tag the upstream publish workflow produces (no semver
+      # tags — see its docker-publish job), so this floats with upstream's
+      # own default branch rather than pinning to an immutable release;
+      # accepted since upstream's master is actively maintained and this
+      # replaces a pin to an *unmaintained* apt snapshot, not a maintained
+      # one. Pulled once per worker job, reused for every region it claims
+      # in its loop below (same "already warm" reasoning docs/ARCHITECTURE.md
+      # gives for the tilemaker binary itself).
+      run: docker pull ghcr.io/systemed/tilemaker:master
 
     - name: Claim and build regions until the queue is empty
       shell: bash
@@ -103,8 +105,15 @@ runs:
           # so the merge job can later glob for just its own layer's shards.
           if [ "$STATUS" -eq 0 ]; then
             for i in "${!BASENAMES[@]}"; do
-              STORE_DIR="$(mktemp -d)"
-              tilemaker --input region.osm.pbf \
+              # Store dir must live under the bind-mounted workspace, not
+              # system /tmp (mktemp's default) — the container can only
+              # see paths under /data (see the docker run below).
+              STORE_DIR="$(mktemp -d -p .)"
+              docker run --rm \
+                --user "$(id -u):$(id -g)" \
+                -v "$GITHUB_WORKSPACE:/data" -w /data \
+                ghcr.io/systemed/tilemaker:master \
+                --input region.osm.pbf \
                 --output "${{ inputs.shards_dir }}/${SAFE_NAME}--${BASENAMES[$i]}.mbtiles" \
                 --config "${CONFIGS[$i]}" --process "${PROCESSES[$i]}" \
                 --store "$STORE_DIR"
