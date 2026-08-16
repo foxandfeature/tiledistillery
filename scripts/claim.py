@@ -101,12 +101,23 @@ def sweep_stale(repo, token, scope, state, ttl_seconds, now, anchor_sha):
     crashed worker's claim becomes reclaimable without a separate job. A
     lock with no `lock-at` ref at all (a crash landed between creating the
     two) is treated as stale immediately — there's no age to compare, and
-    leaving it locked forever would be worse than an extra attempt."""
+    leaving it locked forever would be worse than an extra attempt.
+
+    One region's release is skipped, not raised, on an unexpected failure
+    (for example a persistent GitHub API error): the lock ref for that
+    region is left untouched, so a later sweep just retries it. Raising
+    here would abort the whole caller (`next`/`failed`), which crashes
+    that worker's claim loop entirely and leaves every other stale lock in
+    this batch unreleased too, and leaves this region's own lock stuck
+    forever since the delete never even runs."""
     for region_key in list(state.lock_present):
         ts = state.lock_at.get(region_key)
         if ts is not None and now - ts <= ttl_seconds:
             continue
-        _release_and_record_attempt(repo, token, scope, region_key, state, anchor_sha)
+        try:
+            _release_and_record_attempt(repo, token, scope, region_key, state, anchor_sha)
+        except Exception as exc:
+            print(f"::warning::failed to sweep stale claim for {region_key}: {exc}", file=sys.stderr)
 
 
 def _release_and_record_attempt(repo, token, scope, region_key, state, anchor_sha):
