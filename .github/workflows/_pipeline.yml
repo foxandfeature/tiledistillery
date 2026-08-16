@@ -9,8 +9,9 @@ name: TileDistillery pipeline (reusable)
 # TileAlchemist uses for its own multi-profile runs.
 #
 # prepare -> build (claim-loop matrix) -> check-complete -> topup
-# (conditional second claim-loop round) -> verify-complete (hard gate) ->
-# merge (matrixed per output_basename) -> cleanup (always). Deliberately
+# (conditional second claim-loop round) -> record-timings (always, single
+# writer for the run's whole timing history) -> verify-complete (hard
+# gate) -> merge (matrixed per output_basename) -> cleanup (always). Deliberately
 # does NOT publish anywhere (no GitHub Release, no B2 upload) — that's the
 # calling workflow's job, same separation as TileAlchemist's _pipeline.yml.
 #
@@ -158,6 +159,18 @@ jobs:
           path: shards/*.mbtiles
           if-no-files-found: ignore
 
+      # Same "claimed nothing, so no file was ever written" caveat as
+      # shards above. See docs/ARCHITECTURE.md "Timing history & queue
+      # ordering" and claim-and-build/action.yml: this worker never writes
+      # the shared timing-history file itself, only this local buffer —
+      # `record-timings` below is the one job that does.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: timings-${{ matrix.worker }}
+          path: timings-buffer.jsonl
+          if-no-files-found: ignore
+
   check-complete:
     needs: build
     runs-on: ubuntu-latest
@@ -234,6 +247,65 @@ jobs:
           name: shards-topup-${{ matrix.worker }}
           path: shards/*.mbtiles
           if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: timings-topup-${{ matrix.worker }}
+          path: timings-buffer.jsonl
+          if-no-files-found: ignore
+
+  # Centralizes timing-history recording into a single writer for the whole
+  # run, instead of every worker (or even every worker once) writing the
+  # shared state/timings/<output_basename>.json itself — see
+  # docs/ARCHITECTURE.md "Timing history & queue ordering" and cmd_done /
+  # cmd_flush_timings in scripts/claim.py for why per-writer contention on
+  # that file was a real problem, not just a theoretical one. Independent
+  # of verify-complete: timing history only feeds *future* runs' queue
+  # ordering, never this run's correctness, so it shouldn't gate merge/
+  # publish, and runs unconditionally so a run that ultimately fails
+  # verify-complete still keeps whatever timing data it produced.
+  record-timings:
+    needs: [build, topup]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tiledistillery
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tiledistillery
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r .tiledistillery/scripts/requirements.txt
+
+      # Deliberately no merge-multiple: every worker's buffer file shares
+      # the same filename (timings-buffer.jsonl), so flattening them into
+      # one directory would just overwrite each other. Without
+      # merge-multiple, download-artifact keeps each artifact in its own
+      # subdirectory named after it, which is all flush-timings needs since
+      # it searches --timings-dir recursively.
+      - name: Download every worker's timing buffer, both rounds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: timings-*
+          path: timings
+          if-no-artifact-found: ignore
+
+      - name: Merge into shared timing history (one write for the whole run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .tiledistillery/scripts/claim.py flush-timings \
+            --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+            --state-branch state --output-basename "${{ inputs.output_basename }}" \
+            --timings-dir timings
 
   # The hard gate, run once regardless of how many output_basenames are
   # being built together — completeness is a property of *regions*, which
@@ -331,7 +403,7 @@ jobs:
           path: ${{ matrix.basename }}.pmtiles
 
   cleanup:
-    needs: [check-complete, topup, verify-complete, merge]
+    needs: [check-complete, topup, verify-complete, merge, record-timings]
     if: always()
     runs-on: ubuntu-latest
     permissions:

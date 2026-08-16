@@ -29,6 +29,10 @@ inputs:
   shards_dir:
     required: false
     default: shards
+  timings_buffer:
+    description: 'Local file this worker''s per-region durations are appended to (see cmd_done in scripts/claim.py). The calling job uploads it as an artifact; nothing in this action writes it to the shared state branch.'
+    required: false
+    default: timings-buffer.jsonl
   ttl_seconds:
     description: Stale-claim TTL passed through to claim.py next.
     required: false
@@ -79,19 +83,15 @@ runs:
         # `claim.py done` only appends this worker's durations here, locally
         # (see its docstring for why writing the shared timing-history file
         # once per region — rather than once per worker — turns it into a
-        # hot lock under a full worker fan-out). The trap flushes the whole
-        # buffer in one shared-file write, and fires on every way this
-        # script can end (queue-empty break below, or `set -e` on an
-        # unexpected error further down) so a worker's timing data isn't
-        # lost just because it stopped partway through the queue.
-        TIMINGS_BUFFER="$(mktemp)"
-        flush_timings() {
-          python .tiledistillery/scripts/claim.py flush-timings \
-            --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
-            --state-branch state --output-basename "$OUTPUT_BASENAME" \
-            --timings-buffer "$TIMINGS_BUFFER" || true
-        }
-        trap flush_timings EXIT
+        # hot lock under a full worker fan-out). This action does not write
+        # that shared file itself at all: the calling job uploads this path
+        # as an artifact (same pattern as shards_dir), and a single
+        # dedicated job downloads every worker's buffer from both rounds and
+        # merges them into the shared file in exactly one write — see
+        # `record-timings` in _pipeline.yml and cmd_flush_timings in
+        # scripts/claim.py. That's a single writer for the whole run, not
+        # just a less-contended one.
+        TIMINGS_BUFFER="${{ inputs.timings_buffer }}"
 
         while true; do
           CLAIM_JSON=$(python .tiledistillery/scripts/claim.py next \

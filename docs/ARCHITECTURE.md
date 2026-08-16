@@ -189,20 +189,30 @@ construction.
 
 `state/timings/<output_basename>.json` on the caller's state branch (see
 "State branch" below) holds `{ "<region-id>": [last up to 5 durations in
-seconds] }`. Each worker buffers its own regions' durations locally
-(`claim.py done --timings-buffer`) and merges its whole buffer into this
-shared file in one write at the end of its run (`claim.py flush-timings`,
-triggered by a trap in `claim-and-build/action.yml` so it fires however the
-worker's loop ends), rather than writing this file on every single `done` —
-see `cmd_done`'s docstring in `scripts/claim.py` for why: with
-`worker_count` workers each claiming tens of regions, a write per region
-turns this single shared file into a hot lock that plausibly exhausts
-`update_json_file_with_retry`'s attempts, which used to be a fatal error
-able to kill an otherwise-healthy worker's claim loop mid-run. Batching to
-one write per worker cuts the collision rate on this file by roughly the
-average regions-per-worker count, which is what keeps this
-shared-file-with-retry approach viable at this concurrency, not just a
-smaller blast radius when it fails.
+seconds] }`, and is written by exactly one job per run: `record-timings` in
+`_pipeline.yml`. No worker writes it. Instead, `claim.py done` appends each
+region's duration to a local per-worker file (`--timings-buffer`); the
+calling job (`build`/`topup` in `_pipeline.yml`) uploads that file as an
+artifact the same way it uploads shards; and `record-timings`, which runs
+once after both rounds, downloads every worker's buffer from both rounds
+and merges all of it into the shared file in a single read-modify-write
+(`claim.py flush-timings --timings-dir`). It runs unconditionally
+(`if: always()`) and independently of `verify-complete`, since timing
+history only feeds *future* runs' queue ordering, never this run's
+correctness.
+
+This exists because the file is shared and *not* keyed by its own ref the
+way claims are (see "Locking") — a naive "every worker writes it after
+every region" design turns it into a hot lock: with `worker_count` workers
+each claiming tens of regions, that's hundreds of workers racing the same
+read-modify-write over a run, and under a full fan-out that can exhaust
+`update_json_file_with_retry`'s attempts outright — which used to be a
+fatal error able to kill an otherwise-healthy worker's claim loop mid-run
+(see `cmd_done`'s docstring in `scripts/claim.py`). Funneling every write
+through one job, once, doesn't just reduce that collision rate — it
+removes the concurrent-writer problem this file has entirely, since after
+`build`/`topup` finish there is nothing left running that could race
+`record-timings`'s own single write.
 `<output_basename>` here is the input's raw value, comma(s) and all when
 building more than one layer together (e.g. `state/timings/bins,roads.json`)
 — building `bins,roads` together and calling this pipeline for `bins` alone

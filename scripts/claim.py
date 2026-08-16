@@ -14,16 +14,19 @@ Subcommands, each printing one JSON object to stdout:
     claim.py next          --manifest queue-manifest.json ...        -> {"claimed": bool, "region": {...}|null}
     claim.py done          --region-id X --duration-seconds N ...
     claim.py failed        --region-id X [--error MSG] ...           -> {"permanently_failed": bool, "attempt": int}
-    claim.py flush-timings --timings-buffer PATH ...                 -> {"flushed": int}
+    claim.py flush-timings --timings-dir DIR ...                     -> {"flushed": int}
 
 `done` buffers its duration locally (--timings-buffer) rather than writing
-the shared timing-history file itself; `flush-timings` merges one worker's
-whole buffer into that shared file in a single call. See cmd_done's
-docstring for why.
+the shared timing-history file itself. `flush-timings` is run once, by a
+single dedicated job, against every worker's uploaded buffer from both
+rounds (see _pipeline.yml's `record-timings` job) — one writer, one write,
+for the whole run. See cmd_done's docstring for why per-worker/per-region
+writes from inside the claim loop are the thing being avoided.
 """
 
 import argparse
 import json
+import pathlib
 import sys
 import time
 
@@ -202,35 +205,40 @@ def cmd_done(args):
 
 
 def cmd_flush_timings(args):
-    """Merges this worker's locally buffered durations (from repeated
-    cmd_done calls, one line each) into the shared timing-history file in a
-    single read-modify-write, however many regions this worker built —
-    called once, at the end of a worker's claim loop (see
-    claim-and-build/action.yml). Cuts the write rate on that shared file
-    from "once per region" to "once per worker", which is what actually
-    fixes the contention (see cmd_done), not just tolerates it.
+    """Merges every worker's locally buffered durations (from repeated
+    cmd_done calls, one JSON line each, uploaded as one artifact per worker
+    per round) into the shared timing-history file in a single
+    read-modify-write for the whole run — called exactly once, by a
+    dedicated job downstream of both the build and topup rounds (see
+    `record-timings` in _pipeline.yml). This is the actual fix for the
+    contention cmd_done's docstring describes: not a smaller worker-sized
+    batch racing other workers' batches, but a single writer, so there is
+    no concurrent writer left to race at all.
 
-    Still best-effort: a worker's one flush can in principle still collide
-    with another worker's own flush landing at the same moment, and
-    update_json_file_with_retry can still exhaust its attempts. Losing a
-    batch of timing samples is fine — regions with no recorded history just
-    fall back to byte-size ordering (see docs/ARCHITECTURE.md "Timing
-    history & queue ordering") — so a failure here is logged and swallowed
-    rather than raised, same reasoning as sweep_stale: raising would be a
-    worse outcome (this is typically called at the very end of a worker's
-    run, but claim-and-build also flushes via a trap on any early exit, so
-    a raise here could still abort a loop that has more regions left to
-    claim). Safe to call with a buffer file that's missing or empty."""
-    try:
-        with open(args.timings_buffer) as f:
-            lines = [line for line in f if line.strip()]
-    except FileNotFoundError:
-        lines = []
-    if not lines:
+    `timings_dir` is searched recursively for buffer files (each worker's
+    artifact lands in its own subdirectory after download-artifact, so
+    filenames don't need to be unique across workers). Missing or empty
+    directory means nothing was buffered (e.g. a round that claimed zero
+    regions) — a no-op, not an error.
+
+    Still wrapped, not raised, on failure: this being a single write per
+    run makes update_json_file_with_retry's attempts being exhausted far
+    less likely than under per-region or per-worker writes, but GitHub API
+    trouble unrelated to write contention (an outage, a persistent 5xx)
+    is still possible, and losing this run's timing sample is fine —
+    regions with no recorded history just fall back to byte-size ordering
+    (see docs/ARCHITECTURE.md "Timing history & queue ordering")."""
+    entries = []
+    if args.timings_dir and pathlib.Path(args.timings_dir).is_dir():
+        for path in sorted(pathlib.Path(args.timings_dir).rglob("*")):
+            if not path.is_file():
+                continue
+            with open(path) as f:
+                entries.extend(json.loads(line) for line in f if line.strip())
+
+    if not entries:
         print(json.dumps({"flushed": 0}))
         return
-
-    entries = [json.loads(line) for line in lines]
 
     def apply_batch(timings):
         for entry in entries:
@@ -296,7 +304,7 @@ def main():
 
     p_flush = sub.add_parser("flush-timings")
     _add_common_args(p_flush)
-    p_flush.add_argument("--timings-buffer", required=True)
+    p_flush.add_argument("--timings-dir", required=True, help="Directory to search recursively for workers' uploaded timing-buffer files.")
     p_flush.set_defaults(func=cmd_flush_timings)
 
     args = parser.parse_args()
