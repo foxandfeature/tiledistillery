@@ -120,8 +120,10 @@ runs:
           # not a blip, so it should fall straight through to `claim.py
           # failed` below instead of spending 5 attempts confirming the
           # same absence. All retries happen here, on this same runner,
-          # before the region ever counts as a failed claim attempt.
-          curl -fsSL --retry 5 --retry-connrefused --retry-delay 2 "$PBF_URL" -o region.osm.pbf
+          # before the region ever counts as a failed claim attempt. No
+          # --retry-delay: curl's own default backoff (doubles each attempt,
+          # capped) is what we want, matching the manual backoff below.
+          curl -fsSL --retry 5 --retry-connrefused "$PBF_URL" -o region.osm.pbf
           STATUS=$?
 
           # One fetch, every requested layer built against the same bytes
@@ -129,25 +131,47 @@ runs:
           # split TileAlchemist uses for its own multi-profile runs). Each
           # config gets its own shard file, "<region>--<output_basename>.mbtiles",
           # so the merge job can later glob for just its own layer's shards.
+          #
+          # Retried in place on this same runner, same as curl's download
+          # above: a docker/tilemaker failure has no equivalent to curl's
+          # "404 means genuinely gone" signal (no exit code here means
+          # "permanent"), so every failure gets the same bounded number of
+          # attempts with doubling backoff (4s, 8s, 16s, ...) before this
+          # region counts as a failed claim attempt at all. Capped at 4
+          # attempts (3 retries, ~28s of sleep worst case) rather than
+          # unbounded, so one genuinely broken region (bad tags tilemaker's
+          # Lua chokes on, corrupt extract) can't eat this worker's whole
+          # remaining time budget retrying something no retry will fix.
           if [ "$STATUS" -eq 0 ]; then
-            for i in "${!BASENAMES[@]}"; do
-              # Store dir must live under the bind-mounted workspace, not
-              # system /tmp (mktemp's default) — the container can only
-              # see paths under /data (see the docker run below).
-              STORE_DIR="$(mktemp -d -p .)"
-              docker run --rm \
-                --user "$(id -u):$(id -g)" \
-                -v "$GITHUB_WORKSPACE:/data" -w /data \
-                ghcr.io/systemed/tilemaker:master \
-                --input region.osm.pbf \
-                --output "${{ inputs.shards_dir }}/${SAFE_NAME}--${BASENAMES[$i]}.mbtiles" \
-                --config "${CONFIGS[$i]}" --process "${PROCESSES[$i]}" \
-                --store "$STORE_DIR"
-              STATUS=$?
-              rm -rf "$STORE_DIR"
-              if [ "$STATUS" -ne 0 ]; then
+            BUILD_ATTEMPT=1
+            BUILD_MAX_ATTEMPTS=4
+            while true; do
+              for i in "${!BASENAMES[@]}"; do
+                # Store dir must live under the bind-mounted workspace, not
+                # system /tmp (mktemp's default) — the container can only
+                # see paths under /data (see the docker run below).
+                STORE_DIR="$(mktemp -d -p .)"
+                docker run --rm \
+                  --user "$(id -u):$(id -g)" \
+                  -v "$GITHUB_WORKSPACE:/data" -w /data \
+                  ghcr.io/systemed/tilemaker:master \
+                  --input region.osm.pbf \
+                  --output "${{ inputs.shards_dir }}/${SAFE_NAME}--${BASENAMES[$i]}.mbtiles" \
+                  --config "${CONFIGS[$i]}" --process "${PROCESSES[$i]}" \
+                  --store "$STORE_DIR"
+                STATUS=$?
+                rm -rf "$STORE_DIR"
+                if [ "$STATUS" -ne 0 ]; then
+                  break
+                fi
+              done
+              if [ "$STATUS" -eq 0 ] || [ "$BUILD_ATTEMPT" -ge "$BUILD_MAX_ATTEMPTS" ]; then
                 break
               fi
+              DELAY=$((4 * (2 ** (BUILD_ATTEMPT - 1))))  # 4, 8, 16, ...
+              echo "tilemaker build failed (exit ${STATUS}), retrying in ${DELAY}s (attempt $((BUILD_ATTEMPT + 1))/${BUILD_MAX_ATTEMPTS})"
+              sleep "$DELAY"
+              BUILD_ATTEMPT=$((BUILD_ATTEMPT + 1))
             done
           fi
           set -e

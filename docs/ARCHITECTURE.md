@@ -166,13 +166,18 @@ counters:
   contested; deleting a ref a worker's own claim already owns isn't).
 - **Failed**: create `.../<region-id>/failed` and delete `.../lock/<round>`
   — a single strike, not a retry counter. `claim-and-build`'s own build loop
-  only calls this after it's already exhausted the *retryable* case itself
-  (a `curl --retry`-covered transient download failure, retried on the same
-  runner before the region ever counts as a claim attempt at all); anything
-  that reaches `claim.py failed` is treated as permanent immediately —
-  no more retries, since retrying a genuinely broken region (bad Geofabrik
-  data, a real 404) would just waste other workers' time on the same
-  failure.
+  only calls this after it's already exhausted the *retryable* case itself,
+  on the same runner, before the region ever counts as a claim attempt at
+  all: `curl --retry` for a transient download failure, and a manual
+  doubling-backoff loop (4s, 8s, 16s, up to 4 attempts total) around the
+  `docker run tilemaker` step, since a build failure has no equivalent to
+  curl's "404 means genuinely gone" signal to skip retrying on — every
+  nonzero exit gets the same bounded number of attempts. Anything that
+  still hasn't succeeded after that is treated as permanent immediately —
+  no more retries beyond those bounded, in-place ones, since retrying a
+  genuinely broken region (bad Geofabrik data, a real 404, malformed tags
+  tilemaker's Lua can't handle) across *further* claim attempts would just
+  waste other workers' time on the same failure.
 
 There is deliberately no staleness sweep, timestamp, or attempt counter on
 `lock` itself — within a single round, it is only ever released by the
