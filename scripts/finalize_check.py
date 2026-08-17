@@ -3,8 +3,10 @@
 calling repository's own `state` branch. Prints one JSON object
 `{"done": [...], "failed": [...], "remaining": [...]}` (region ids) to
 stdout. `remaining` is what's neither done nor permanently failed — a
-non-empty `remaining` after the top-up rounds are exhausted means the run
-is incomplete (see docs/ARCHITECTURE.md "Merge").
+non-empty `remaining` once the claim-loop round is finished means the run
+is incomplete (see docs/ARCHITECTURE.md "Merge"): either the queue never
+got claimed in time, or a worker crashed mid-build and left its region's
+lock stuck (see docs/ARCHITECTURE.md "Locking").
 
 With --fail-if-incomplete, exits non-zero (after printing the JSON) when
 `remaining` is non-empty, for use as the very last check before merging.
@@ -51,7 +53,7 @@ def main():
         print(f"::warning::{len(failed)} region(s) permanently failed: {', '.join(failed)}", file=sys.stderr)
 
     if args.fail_if_incomplete and remaining:
-        print(f"::error::{len(remaining)} region(s) still not built after all rounds: {', '.join(remaining)}", file=sys.stderr)
+        print(f"::error::{len(remaining)} region(s) still not built: {', '.join(remaining)}", file=sys.stderr)
         sys.exit(1)
 
 
