@@ -190,7 +190,12 @@ def get_json_file(repo, token, branch, path):
 def put_json_file(repo, token, branch, path, content_dict, sha, message):
     """Returns True on success. Returns False on a 409/422 conflict (branch
     moved since `sha` was read) so the caller can re-fetch, re-merge the
-    mutation, and retry — see update_json_file_with_retry."""
+    mutation, and retry — see update_json_file_with_retry. Also False on a
+    403 that reaches this point: _request already raises TokenPermissionError
+    immediately for a genuine permission-denied 403, so a 403 surviving to
+    here can only be the ambiguous/rate-limit-shaped kind that exhausted
+    _request's own retries — worth another read-modify-write cycle (with
+    update_json_file_with_retry's own backoff) rather than a hard crash."""
     quoted = urllib.parse.quote(path)
     payload = {
         "message": message,
@@ -204,7 +209,7 @@ def put_json_file(repo, token, branch, path, content_dict, sha, message):
     resp = _request("PUT", f"/repos/{repo}/contents/{quoted}", token, json=payload)
     if resp.status_code in (200, 201):
         return True
-    if resp.status_code in (409, 422):
+    if resp.status_code in (403, 409, 422):
         return False
     resp.raise_for_status()
     return False

@@ -95,6 +95,18 @@ class ClaimState:
 
 MAX_ATTEMPTS = 3
 
+# cmd_next creates `.../lock` and `.../lock-at/<ts>` as two separate API
+# calls, not one atomic write (see ClaimState's docstring for why they
+# can't be merged into a single ref). A concurrent worker's sweep_stale,
+# reading state in the gap between those two calls, sees a lock with no
+# lock-at and — absent this grace period — would mistake a claim that's
+# still being established for one that crashed mid-claim, stealing it out
+# from under the worker that's still building. Comfortably longer than one
+# API round trip so a live claimant's lock-at almost always shows up
+# before the recheck; not a guarantee under sustained rate-limit backoff
+# in _request, just a large reduction in how often this races.
+_STALE_LOCK_GRACE_SECONDS = 10
+
 
 def load_state(repo, token, scope):
     refs = common.list_matching_refs(repo, token, f"claims/{scope}")
@@ -108,9 +120,11 @@ def region_key_of(region_id):
 def sweep_stale(repo, token, scope, state, ttl_seconds, now, anchor_sha):
     """Releases locks older than the TTL and records the attempt, so a
     crashed worker's claim becomes reclaimable without a separate job. A
-    lock with no `lock-at` ref at all (a crash landed between creating the
-    two) is treated as stale immediately — there's no age to compare, and
-    leaving it locked forever would be worse than an extra attempt.
+    lock with no `lock-at` ref at all is *not* swept on sight — see
+    _STALE_LOCK_GRACE_SECONDS — it's given one grace-period wait and a
+    fresh re-read; only what's still lock-at-less after that is treated as
+    a crash landed between creating the two, and leaving it locked forever
+    would be worse than an extra attempt.
 
     One region's release is skipped, not raised, on an unexpected failure
     (for example a persistent GitHub API error): the lock ref for that
@@ -119,6 +133,22 @@ def sweep_stale(repo, token, scope, state, ttl_seconds, now, anchor_sha):
     that worker's claim loop entirely and leaves every other stale lock in
     this batch unreleased too, and leaves this region's own lock stuck
     forever since the delete never even runs."""
+    grace_candidates = [
+        region_key for region_key in state.lock_present
+        if state.lock_at.get(region_key) is None
+    ]
+    if grace_candidates:
+        time.sleep(_STALE_LOCK_GRACE_SECONDS)
+        refreshed = load_state(repo, token, scope)
+        for region_key in grace_candidates:
+            if region_key in refreshed.lock_at:
+                state.lock_at[region_key] = refreshed.lock_at[region_key]
+            elif region_key not in refreshed.lock_present:
+                # Resolved (done/failed/reclaimed) between our two reads —
+                # nothing for this pass to release; a later sweep will
+                # judge whatever's there by then on its own merits.
+                state.lock_present.discard(region_key)
+
     for region_key in list(state.lock_present):
         ts = state.lock_at.get(region_key)
         if ts is not None and now - ts <= ttl_seconds:
