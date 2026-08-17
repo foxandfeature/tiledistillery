@@ -38,6 +38,8 @@ import json
 import pathlib
 import sys
 
+import requests
+
 import common
 import leaves
 
@@ -126,8 +128,22 @@ def cmd_done(args):
     scope = scope_prefix(args.output_basename)
     region_key = region_key_of(args.region_id)
 
-    common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/done", anchor_sha)
-    common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock")
+    # Not raised on failure: a persistent GitHub outage (5xx/network trouble
+    # surviving common._request's own retries) landing here means the region
+    # already finished building — crashing this worker over it would abort
+    # its whole claim loop and strand every region still left in its queue,
+    # not just this one. Per ClaimState's docstring, a lock nothing ever
+    # releases is already an accepted state (indistinguishable from a worker
+    # that crashed outright) that cleanup_claims.py wipes at the end of the
+    # run regardless, so leaving it stuck here is strictly better than
+    # taking the whole worker down with it. TokenPermissionError (a real
+    # permissions problem, not a blip) is deliberately not caught here — see
+    # its docstring — and still propagates.
+    try:
+        common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/done", anchor_sha)
+        common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock")
+    except requests.RequestException as exc:
+        print(f"::warning::{args.region_id} done-marking failed, lock left stuck for this run: {exc}", file=sys.stderr)
 
     # Duration goes to a local, per-worker file, not straight to the shared
     # state/timings/<output_basename>.json — a worker claims tens of regions
@@ -207,8 +223,14 @@ def cmd_failed(args):
     scope = scope_prefix(args.output_basename)
     region_key = region_key_of(args.region_id)
 
-    common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/failed", anchor_sha)
-    common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock")
+    # See cmd_done's matching try/except: same reasoning applies here, so a
+    # transient GitHub outage strands one lock instead of this worker's
+    # whole remaining queue.
+    try:
+        common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/failed", anchor_sha)
+        common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock")
+    except requests.RequestException as exc:
+        print(f"::warning::{args.region_id} failed-marking failed, lock left stuck for this run: {exc}", file=sys.stderr)
     if args.error:
         print(f"::warning::{args.region_id} failed: {args.error}", file=sys.stderr)
     print(json.dumps({"permanently_failed": True}))
