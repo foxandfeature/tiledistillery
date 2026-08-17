@@ -66,11 +66,11 @@ binary, Geofabrik download setup) once per *leaf*, which is wasteful when
 most leaves are small and there are hundreds of them.
 
 Instead, `_pipeline.yml` starts a fixed number of long-lived **worker**
-jobs in one `build` matrix (`worker_count` input, default ~40, well inside
-GitHub's per-repo concurrent-job ceiling for a public repo — see
-"Distribution" below for why this is deliberately generous rather than
-tuned to the minimum that keeps up with the queue). Each worker runs a
-loop, not a single region:
+jobs in one `build` matrix (`worker_count` input, default ~20 — GitHub
+already queues more than ~20 concurrently *running* jobs on a public repo,
+so this is comfortably real parallelism, not queued waiting; see
+TileAlchemist's ARCHITECTURE.md "Parallelism" for the same reasoning). Each
+worker runs a loop, not a single region:
 
 1. Claim the best remaining candidate from the precomputed, duration-sorted
    list (see "Timing history") — one claim per region, never per
@@ -93,15 +93,12 @@ soon as it's done": the next claim happens inside the same job, immediately,
 with the tilemaker binary and checkout already warm, not via a fresh job
 dispatch per region.
 
-`worker_count`'s default is chosen generously, not just enough to drain the
-queue in reasonable time: with a single claim-loop round (see "Worker job
-shape & the 6-hour limit" — there is deliberately no second, top-up round),
-headroom in the worker count is what keeps one worker crashing or hitting
-its own time limit from costing more than the region(s) it happened to be
-holding. `strategy: fail-fast: false` on the `build` matrix means a failing
-leg never cancels its siblings, so the rest of a generously-sized fleet
-just keeps draining the same shared queue regardless of how any one worker
-ends.
+There is deliberately no second, top-up claim-loop round (see "Worker job
+shape & the 6-hour limit"): `strategy: fail-fast: false` on the `build`
+matrix means a failing leg never cancels its siblings, so the rest of the
+fleet just keeps draining the same shared queue regardless of how any one
+worker ends — kept simple on purpose, one round, one worker_count, no
+conditional second dispatch to reason about.
 
 ## State lives in the caller's repo, not this one
 
@@ -193,11 +190,14 @@ ever released by the worker that holds it, via `done` or `failed`. A worker
 that never gets there (job cancelled, OOM-killed, or hits the time limit
 mid-build) leaves that one region's `lock` stuck for the rest of the run —
 there is no second round to pick it up (see "Worker job shape & the 6-hour
-limit"). Accepted for now to keep the state machine this small: a
-generous `worker_count` (see "Distribution") means one stuck lock costs
-exactly the region(s) that one worker was holding, not the run's overall
-throughput, since every other worker in the same `fail-fast: false` matrix
-keeps draining the queue regardless. `cleanup_claims.py` wipes every ref
+limit"), and no amount of extra `worker_count` reclaims it either: more
+workers only help a region that was never claimed in time, not one a
+worker already claimed and then died holding, since every other worker
+still treats an existing `lock` as unavailable regardless of who (or what)
+is behind it. Accepted for now to keep the state machine this small — see
+"Deliberately deferred" for the actual fix (a targeted reclaim pass) if
+this turns out to be a real, recurring problem rather than a theoretical
+one. `cleanup_claims.py` wipes every ref
 under the scope prefix at the end of the run regardless of how it went (see
 below), so a stuck lock can't outlive the run it happened in, and the
 practical cost is that the *specific regions* affected need a manual rerun
@@ -300,13 +300,14 @@ or stuck under a now-dead worker's `lock` (see "Locking") — not every worker
 processing a full 6 hours' worth of tiny regions, since the queue simply
 empties once every leaf is claimed.
 
-There is deliberately no second, top-up claim-loop round to mop this up:
-one round, with a generous `worker_count` (see "Distribution"), instead —
-`fail-fast: false` means one worker's bad ending never cancels the rest of
-the matrix, so the fleet as a whole keeps draining the queue regardless of
-any single worker's fate, and a stuck `lock` from the one worker that
-actually crashed mid-build costs only the region(s) it was holding, not the
-run (see "Locking" for that trade-off in full and its mitigation). The
+There is deliberately no second, top-up claim-loop round to mop this up —
+kept to one round on purpose (see "Distribution"): `fail-fast: false` means
+one worker's bad ending never cancels the rest of the matrix, so the fleet
+as a whole keeps draining the queue regardless of any single worker's fate,
+and a stuck `lock` from the one worker that actually crashed mid-build
+costs only the region(s) it was holding, not the run (see "Locking" for
+that trade-off in full, and "Deliberately deferred" for the actual fix if
+it's ever needed). The
 `verify-complete` job (`if: always()`, so it still runs and reports
 correctly even if one `build` leg failed at the job level) fails the run
 loudly if any region is left neither `done` nor `failed`, rather than
@@ -486,7 +487,7 @@ number against.
 - `output_basename` — required, one value or a comma-separated list
   matched 1:1 with `config`/`process`.
 - `attribution` — required, one value applied to every layer in the call.
-- `worker_count` — default ~40, deliberately generous (see "Distribution").
+- `worker_count` — default ~20 (see "Distribution").
 - `region_scope` — optional Geofabrik path prefix filter (e.g.
   `europe/monaco`); default empty = every leaf, whole world. Exists so a
   caller (including this repo's own CI, see below) can run the pipeline
@@ -533,11 +534,17 @@ separate, later, out-of-scope repo.
   blocks the run) and loosen only if real Geofabrik data makes that
   impractical.
 - Stale-claim reclaim for a worker that crashes mid-build without releasing
-  its `lock` — deliberately not built (see "Locking"); mitigated instead by
-  a deliberately generous `worker_count` and a single claim-loop round with
-  no top-up pass, so a stuck lock costs the region(s) that one worker was
-  holding, not the run. Revisit (a TTL-based sweep, or reintroducing a
-  second round) if that turns out to be a real, recurring problem rather
-  than a theoretical one.
+  its `lock` — deliberately not built (see "Locking"). A bigger
+  `worker_count` does *not* fix this (it only helps a region that was never
+  claimed in time, not one already claimed and then abandoned), so this is
+  accepted as-is: a stuck lock costs the region(s) that one worker was
+  holding, and the run needs a manual rerun (e.g. via `region_scope`) to
+  pick those back up. The straightforward fix, if this turns out to be a
+  real, recurring problem rather than a theoretical one: after `build`
+  finishes, any leftover `lock` ref is *known* stale (every worker that
+  could hold one has already terminated, per the workflow's own `needs:`
+  graph), so a small cleanup step could safely delete them and dispatch one
+  bounded follow-up pass sized to just the leftover regions — not a full
+  second `worker_count`-sized fleet.
 - Release-vs-B2 size threshold default — caller-tunable input, no default
   chosen here since this repo builds no real layer to size it against.

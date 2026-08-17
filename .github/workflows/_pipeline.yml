@@ -11,13 +11,13 @@ name: TileDistillery pipeline (reusable)
 # prepare -> build (single claim-loop matrix) -> record-timings (always,
 # single writer for the run's whole timing history) -> verify-complete
 # (hard gate) -> merge (matrixed per output_basename) -> cleanup (always).
-# One round, not two: worker_count is deliberately generous (see
-# docs/ARCHITECTURE.md "Distribution") so a worker crashing mid-region or
-# hitting its own time wall costs that one region, not a second dispatch —
-# every other worker in the same matrix keeps draining the queue regardless
-# (`fail-fast: false`). Deliberately does NOT publish anywhere (no GitHub
-# Release, no B2 upload) — that's the calling workflow's job, same
-# separation as TileAlchemist's _pipeline.yml.
+# One round, not two, kept simple on purpose (see docs/ARCHITECTURE.md
+# "Distribution"): a worker crashing mid-region or hitting its own time
+# wall costs that one region, not a second dispatch — every other worker in
+# the same matrix keeps draining the queue regardless (`fail-fast: false`).
+# Deliberately does NOT publish anywhere (no GitHub Release, no B2 upload)
+# — that's the calling workflow's job, same separation as TileAlchemist's
+# _pipeline.yml.
 #
 # State (claim refs + timing history) lives on the CALLING repo's own
 # `state` branch, never in this repo — see docs/ARCHITECTURE.md "State
@@ -50,10 +50,10 @@ on:
         required: true
         type: string
       worker_count:
-        description: 'How many parallel claim-loop workers to fan out into (see docs/ARCHITECTURE.md "Distribution"). Deliberately generous: with one claim-loop round (no topup), headroom here is what absorbs a worker crashing or timing out, since every other worker keeps draining the same queue.'
+        description: 'How many parallel claim-loop workers to fan out into (see docs/ARCHITECTURE.md "Distribution"). With one claim-loop round (no topup), fail-fast: false is what absorbs a worker crashing or timing out — every other worker keeps draining the same queue.'
         required: false
         type: string
-        default: "40"
+        default: "20"
       region_scope:
         description: 'Optional Geofabrik path prefix (e.g. "europe/monaco") to restrict the build to a subtree instead of the whole world.'
         required: false
