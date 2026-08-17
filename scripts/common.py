@@ -21,8 +21,12 @@ _API_VERSION = "2022-11-28"
 
 # GitHub's secondary rate limits ask for backoff, not an immediate retry;
 # a handful of workers hammering the same repo's API can plausibly hit this.
+# Doubling from 4s (4, 8, 16, 32, 64, 128) rather than an immediate/short
+# retry: this is the GitHub API itself, not this runner, being asked to
+# recover, so the same "give the other side room" reasoning as the curl
+# download retry applies, just against a different server.
 _MAX_RETRIES = 6
-_BACKOFF_BASE_S = 1.5
+_BACKOFF_BASE_S = 4
 
 
 def _headers(token):

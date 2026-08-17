@@ -19,18 +19,24 @@ Subcommands, each printing one JSON object to stdout:
 `failed` is a single strike, not a retry counter: a region either finishes
 via `done` or is marked permanently `failed` the first time
 `claim-and-build` calls this after a build fails. Retrying transient
-failures (a flaky download) is the caller's job, on the same runner,
-*before* it ever calls `failed` — see the retry flags on `claim-and-build`'s
-own `curl` step — since retrying a genuinely broken region (bad Geofabrik
-data, a real 404) from here would just waste other workers' time on the
-same failure.
+failures (a flaky download, a flaky GitHub API call) is the caller's job,
+on the same runner, *before* it ever calls `failed` — see the retry
+flags/loops on `claim-and-build`'s own `curl` step and `common.py`'s
+`_request` — since retrying a genuinely broken region (bad Geofabrik data,
+a real 404, or a build that fails on tilemaker's own terms) from here would
+just waste other workers' time on the same failure. Deliberately not
+retried here: a `docker run tilemaker` failure. Unlike a download or a
+GitHub API call, there's no *server* on the other end of it that could be
+transiently down — this runner is the only thing running it — so a nonzero
+exit is tilemaker's own verdict on this region's data, not a blip worth
+retrying.
 
 `done` buffers its duration locally (--timings-buffer) rather than writing
 the shared timing-history file itself. `flush-timings` is run once, by a
-single dedicated job, against every worker's uploaded buffer from both
-rounds (see _pipeline.yml's `record-timings` job) — one writer, one write,
-for the whole run. See cmd_done's docstring for why per-worker/per-region
-writes from inside the claim loop are the thing being avoided.
+single dedicated job, against every worker's uploaded buffer (see
+_pipeline.yml's `record-timings` job) — one writer, one write, for the
+whole run. See cmd_done's docstring for why per-worker/per-region writes
+from inside the claim loop are the thing being avoided.
 """
 
 import argparse
@@ -60,7 +66,10 @@ class ClaimState:
     region's `lock` stuck for the rest of this run — accepted for now to
     keep the state machine to three ref kinds; `cleanup_claims.py` wipes
     everything at the end of every run regardless of how it went, so this
-    can't accumulate across runs.
+    can't accumulate across runs. `worker_count` (see
+    docs/ARCHITECTURE.md "Distribution") is the mitigation: enough workers
+    fanned out into one round means one stuck lock costs one region, not
+    the run, and every other worker keeps draining the queue regardless.
     """
 
     def __init__(self, refs, prefix):
@@ -177,19 +186,18 @@ def cmd_done(args):
 
 def cmd_flush_timings(args):
     """Merges every worker's locally buffered durations (from repeated
-    cmd_done calls, one JSON line each, uploaded as one artifact per worker
-    per round) into the shared timing-history file in a single
-    read-modify-write for the whole run — called exactly once, by a
-    dedicated job downstream of both the build and topup rounds (see
-    `record-timings` in _pipeline.yml). This is the actual fix for the
-    contention cmd_done's docstring describes: not a smaller worker-sized
-    batch racing other workers' batches, but a single writer, so there is
-    no concurrent writer left to race at all.
+    cmd_done calls, one JSON line each, uploaded as one artifact per worker)
+    into the shared timing-history file in a single read-modify-write for
+    the whole run — called exactly once, by a dedicated job downstream of
+    `build` (see `record-timings` in _pipeline.yml). This is the actual fix
+    for the contention cmd_done's docstring describes: not a smaller
+    worker-sized batch racing other workers' batches, but a single writer,
+    so there is no concurrent writer left to race at all.
 
     `timings_dir` is searched recursively for buffer files (each worker's
     artifact lands in its own subdirectory after download-artifact, so
     filenames don't need to be unique across workers). Missing or empty
-    directory means nothing was buffered (e.g. a round that claimed zero
+    directory means nothing was buffered (e.g. a run that claimed zero
     regions) — a no-op, not an error.
 
     Still wrapped, not raised, on failure: this being a single write per

@@ -3,13 +3,12 @@ description: >
   Pulls the tilemaker image and this pipeline's own scripts, then loops
   claiming leaf regions from the shared queue (see docs/ARCHITECTURE.md
   "Distribution" and "Locking") and building each with tilemaker, until the
-  queue is exhausted or this job runs low on time. Used identically by
-  _pipeline.yml's main build round and its top-up round. Assumes the caller
-  repo is already checked out at the workspace root and this pipeline's own
-  repo under `.tiledistillery/`. config/process/output_basename take one
-  value each, or comma-separated lists matched 1:1 — building more than one
-  layer this way claims a region once and downloads its .osm.pbf once,
-  running tilemaker once per config against those same bytes (see
+  queue is exhausted or this job runs low on time. Assumes the caller repo
+  is already checked out at the workspace root and this pipeline's own repo
+  under `.tiledistillery/`. config/process/output_basename take one value
+  each, or comma-separated lists matched 1:1 — building more than one layer
+  this way claims a region once and downloads its .osm.pbf once, running
+  tilemaker once per config against those same bytes (see
   docs/ARCHITECTURE.md "Distribution", the same optimization TileAlchemist
   applies to its own multi-profile runs).
 inputs:
@@ -45,7 +44,31 @@ runs:
       shell: bash
       run: pip install -r .tiledistillery/scripts/requirements.txt
 
+    # Claims this worker's first region *before* pulling the (large)
+    # tilemaker image, not after: with worker_count fanned out well past
+    # how many regions are actually left near the end of a run (see
+    # docs/ARCHITECTURE.md "Distribution"), a worker that starts to find the
+    # queue already fully claimed by its siblings has no use for the image
+    # at all. Paying for setup-python/pip install first is unavoidable —
+    # claim.py itself needs `requests` just to make this one check — but
+    # that's a small, fast install next to a multi-hundred-MB docker pull.
+    - name: Claim this worker's first region
+      id: first-claim
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        OUTPUT_BASENAME: ${{ inputs.output_basename }}
+      run: |
+        set -euo pipefail
+        CLAIM_JSON=$(python .tiledistillery/scripts/claim.py next \
+          --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+          --state-branch state --output-basename "$OUTPUT_BASENAME" \
+          --manifest "${{ inputs.manifest }}")
+        echo "$CLAIM_JSON" > first-claim.json
+        echo "claimed=$(jq -r '.claimed' <<<"$CLAIM_JSON")" >> "$GITHUB_OUTPUT"
+
     - name: Pull tilemaker image
+      if: steps.first-claim.outputs.claimed == 'true'
       shell: bash
       # ghcr.io/systemed/tilemaker is the project's own published image —
       # current tilemaker, not whatever's frozen in Ubuntu's universe repo
@@ -58,10 +81,13 @@ runs:
       # replaces a pin to an *unmaintained* apt snapshot, not a maintained
       # one. Pulled once per worker job, reused for every region it claims
       # in its loop below (same "already warm" reasoning docs/ARCHITECTURE.md
-      # gives for the tilemaker binary itself).
+      # gives for the tilemaker binary itself), and skipped entirely above
+      # when this worker's very first claim attempt already found nothing
+      # left to build.
       run: docker pull ghcr.io/systemed/tilemaker:master
 
     - name: Claim and build regions until the queue is empty
+      if: steps.first-claim.outputs.claimed == 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
@@ -82,19 +108,20 @@ runs:
         # hot lock under a full worker fan-out). This action does not write
         # that shared file itself at all: the calling job uploads this path
         # as an artifact (same pattern as shards_dir), and a single
-        # dedicated job downloads every worker's buffer from both rounds and
-        # merges them into the shared file in exactly one write — see
-        # `record-timings` in _pipeline.yml and cmd_flush_timings in
-        # scripts/claim.py. That's a single writer for the whole run, not
-        # just a less-contended one.
+        # dedicated job downloads every worker's buffer and merges them into
+        # the shared file in exactly one write — see `record-timings` in
+        # _pipeline.yml and cmd_flush_timings in scripts/claim.py. That's a
+        # single writer for the whole run, not just a less-contended one.
         TIMINGS_BUFFER="${{ inputs.timings_buffer }}"
 
-        while true; do
-          CLAIM_JSON=$(python .tiledistillery/scripts/claim.py next \
-            --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
-            --state-branch state --output-basename "$OUTPUT_BASENAME" \
-            --manifest "${{ inputs.manifest }}")
+        # Seeded from the first-claim step above, so this loop doesn't spend
+        # a second claim attempt re-discovering what that step already
+        # found; every later iteration re-claims at the bottom of the loop
+        # body instead.
+        CLAIM_JSON=$(cat first-claim.json)
+        rm -f first-claim.json
 
+        while true; do
           CLAIMED=$(jq -r '.claimed' <<<"$CLAIM_JSON")
           if [ "$CLAIMED" != "true" ]; then
             echo "queue empty, worker exiting"
@@ -115,8 +142,11 @@ runs:
           # not a blip, so it should fall straight through to `claim.py
           # failed` below instead of spending 5 attempts confirming the
           # same absence. All retries happen here, on this same runner,
-          # before the region ever counts as a failed claim attempt.
-          curl -fsSL --retry 5 --retry-connrefused --retry-delay 2 "$PBF_URL" -o region.osm.pbf
+          # before the region ever counts as a failed claim attempt. No
+          # --retry-delay: curl's own default backoff (starts small, doubles
+          # each attempt, capped) is what we want here — Geofabrik being the
+          # thing that might be transiently down, not this runner.
+          curl -fsSL --retry 5 --retry-connrefused "$PBF_URL" -o region.osm.pbf
           STATUS=$?
 
           # One fetch, every requested layer built against the same bytes
@@ -124,6 +154,15 @@ runs:
           # split TileAlchemist uses for its own multi-profile runs). Each
           # config gets its own shard file, "<region>--<output_basename>.mbtiles",
           # so the merge job can later glob for just its own layer's shards.
+          #
+          # Deliberately NOT retried: unlike the curl download above (a
+          # remote server that can be transiently down) or the claim.py
+          # calls below (the GitHub API, same story — see common.py's own
+          # retry/backoff), tilemaker runs entirely on this runner. A
+          # nonzero exit here is tilemaker's own verdict on this region's
+          # data (or, rarely, a real local resource problem), not a blip —
+          # retrying it would only delay the same outcome. One claim
+          # attempt, pass or fail, straight through to done/failed below.
           if [ "$STATUS" -eq 0 ]; then
             for i in "${!BASENAMES[@]}"; do
               # Store dir must live under the bind-mounted workspace, not
@@ -160,10 +199,10 @@ runs:
           else
             # A region is one atomic unit of work across every config built
             # together in this call: if any of them failed, the whole
-            # region is retried (all configs again) rather than tracking
-            # partial per-config success — simpler, and consistent with
-            # regions (not configs) being the thing that gets claimed. Any
-            # shard already written by a config that succeeded before a
+            # region is marked failed as a whole (all configs), rather than
+            # tracking partial per-config success — simpler, and consistent
+            # with regions (not configs) being the thing that gets claimed.
+            # Any shard already written by a config that succeeded before a
             # later one failed must not survive into the shards artifact,
             # since this region is about to be marked failed, not done.
             rm -f "${{ inputs.shards_dir }}/${SAFE_NAME}--"*.mbtiles
@@ -173,4 +212,9 @@ runs:
               --region-id "$REGION_ID" \
               --error "build failed (exit ${STATUS})"
           fi
+
+          CLAIM_JSON=$(python .tiledistillery/scripts/claim.py next \
+            --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+            --state-branch state --output-basename "$OUTPUT_BASENAME" \
+            --manifest "${{ inputs.manifest }}")
         done

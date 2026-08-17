@@ -66,29 +66,39 @@ binary, Geofabrik download setup) once per *leaf*, which is wasteful when
 most leaves are small and there are hundreds of them.
 
 Instead, `_pipeline.yml` starts a fixed number of long-lived **worker**
-jobs (`worker_count` input, default ~20 — GitHub already queues more than
-~20 concurrently *running* jobs on a public repo, so a higher count doesn't
-add real parallelism, only job count; see TileAlchemist's ARCHITECTURE.md
-"Parallelism" for the same reasoning). Each worker runs a loop, not a single
-region:
+jobs in one `build` matrix (`worker_count` input, default ~20 — GitHub
+already queues more than ~20 concurrently *running* jobs on a public repo,
+so this is comfortably real parallelism, not queued waiting; see
+TileAlchemist's ARCHITECTURE.md "Parallelism" for the same reasoning). Each
+worker runs a loop, not a single region:
 
-1. Fetch the current claim state (see "Locking" below) and the precomputed,
-   duration-sorted candidate list (see "Timing history").
-2. Attempt to claim the best remaining candidate — one claim per region,
-   never per `output_basename` (see "Locking" for why that matters when a
-   call builds more than one layer together).
-3. On success: download that leaf's `.osm.pbf` **once**, run tilemaker
-   once per `output_basename` in this call against those same bytes (see
-   "Multiple layers, one download" below), upload each resulting
+1. Claim the best remaining candidate from the precomputed, duration-sorted
+   list (see "Timing history") — one claim per region, never per
+   `output_basename` (see "Locking" for why that matters when a call builds
+   more than one layer together). If nothing is claimable — the queue was
+   already fully claimed by sibling workers before this one got its first
+   turn — exit immediately, *before* even pulling the tilemaker image (see
+   `claim-and-build`'s own `first-claim` step): a worker with nothing to
+   build has no use for a several-hundred-MB image download.
+2. Download that leaf's `.osm.pbf` **once**, run tilemaker once per
+   `output_basename` in this call against those same bytes (see "Multiple
+   layers, one download" below), upload each resulting
    `<region-id>--<output_basename>.mbtiles`, record the claim as done and
    append this run's duration to the timing history.
-4. Loop back to 1. Exit when no claimable candidate remains, or the job's
+3. Loop back to 1. Exit when no claimable candidate remains, or the job's
    own time budget runs low.
 
 This is the literal implementation of "a worker requests the next region as
 soon as it's done": the next claim happens inside the same job, immediately,
 with the tilemaker binary and checkout already warm, not via a fresh job
 dispatch per region.
+
+There is deliberately no second, top-up claim-loop round (see "Worker job
+shape & the 6-hour limit"): `strategy: fail-fast: false` on the `build`
+matrix means a failing leg never cancels its siblings, so the rest of the
+fleet just keeps draining the same shared queue regardless of how any one
+worker ends — kept simple on purpose, one round, one worker_count, no
+conditional second dispatch to reason about.
 
 ## State lives in the caller's repo, not this one
 
@@ -115,7 +125,7 @@ different layers), so claims and timing history are still scoped by
 
 ## Locking: git refs as the claim mechanism
 
-Up to ~20 workers can race to claim the same region. The mechanism is atomic
+Up to `worker_count` workers can race to claim the same region. The mechanism is atomic
 git ref creation, one ref per region, under a scope prefix identifying
 *which build* (within this repo) is running:
 `refs/claims/<output_basename>/<region-id>/...` — e.g. a `bins` layer build
@@ -160,26 +170,41 @@ counters:
   deleting a ref a worker's own claim already owns isn't).
 - **Failed**: create `.../<region-id>/failed` and delete `.../lock` — a
   single strike, not a retry counter. `claim-and-build`'s own build loop
-  only calls this after it's already exhausted the *retryable* case itself
-  (a `curl --retry`-covered transient download failure, retried on the same
-  runner before the region ever counts as a claim attempt at all); anything
-  that reaches `claim.py failed` is treated as permanent immediately —
-  no more retries, since retrying a genuinely broken region (bad Geofabrik
-  data, a real 404) would just waste other workers' time on the same
-  failure.
+  only calls this after it's already exhausted the *retryable* cases,
+  on the same runner, before the region ever counts as a claim attempt at
+  all — but only for the steps that talk to a server that could be
+  transiently down: `curl --retry` around the Geofabrik download, and
+  `common.py`'s own retry/backoff (4s, 8s, 16s, ... up to 6 attempts —
+  see `_BACKOFF_BASE_S`) around every GitHub API call `claim.py` itself
+  makes (claiming, marking done/failed, listing state). Deliberately
+  **not** retried: the `docker run tilemaker` build step itself. Unlike a
+  download or a GitHub API call, there's no remote server on the other end
+  of it that could be transiently down — this runner is the only thing
+  running it — so a nonzero exit there is tilemaker's own verdict on this
+  region's data, and retrying it in place would just delay the same
+  outcome. One build attempt, pass or fail, reaches `claim.py failed`
+  directly.
 
 There is deliberately no staleness sweep or crash-reclaim: a `lock` is only
 ever released by the worker that holds it, via `done` or `failed`. A worker
 that never gets there (job cancelled, OOM-killed, or hits the time limit
 mid-build) leaves that one region's `lock` stuck for the rest of the run —
-`topup` cannot pick it up. Accepted for now to keep the state machine this
-small; `cleanup_claims.py` wipes every ref under the scope prefix at the end
-of the run regardless of how it went (see below), so a stuck lock can't
-outlive the run it happened in, and the practical cost is that one run needs
-a manual retry rather than self-healing through a second `topup` round. A
-TTL-based sweep is the obvious way back to that self-healing if a stuck
-worker turns out to be a real, recurring problem in practice — deliberately
-not built preemptively.
+there is no second round to pick it up (see "Worker job shape & the 6-hour
+limit"), and no amount of extra `worker_count` reclaims it either: more
+workers only help a region that was never claimed in time, not one a
+worker already claimed and then died holding, since every other worker
+still treats an existing `lock` as unavailable regardless of who (or what)
+is behind it. Accepted for now to keep the state machine this small — see
+"Deliberately deferred" for the actual fix (a targeted reclaim pass) if
+this turns out to be a real, recurring problem rather than a theoretical
+one. `cleanup_claims.py` wipes every ref
+under the scope prefix at the end of the run regardless of how it went (see
+below), so a stuck lock can't outlive the run it happened in, and the
+practical cost is that the *specific regions* affected need a manual rerun
+(e.g. via `region_scope`) rather than the whole run self-healing through a
+second pass. A TTL-based sweep, or a second claim-loop round, are both
+obvious ways back to that self-healing if stuck locks turn out to be a
+real, recurring problem in practice — deliberately not built preemptively.
 
 Why refs and not, say, a shared `queue.json` committed to the state branch:
 every worker touching the same file still races at the branch-tip level
@@ -215,14 +240,13 @@ construction.
 seconds] }`, and is written by exactly one job per run: `record-timings` in
 `_pipeline.yml`. No worker writes it. Instead, `claim.py done` appends each
 region's duration to a local per-worker file (`--timings-buffer`); the
-calling job (`build`/`topup` in `_pipeline.yml`) uploads that file as an
-artifact the same way it uploads shards; and `record-timings`, which runs
-once after both rounds, downloads every worker's buffer from both rounds
-and merges all of it into the shared file in a single read-modify-write
-(`claim.py flush-timings --timings-dir`). It runs unconditionally
-(`if: always()`) and independently of `verify-complete`, since timing
-history only feeds *future* runs' queue ordering, never this run's
-correctness.
+`build` job uploads that file as an artifact the same way it uploads
+shards; and `record-timings`, which runs once after `build` finishes,
+downloads every worker's buffer and merges all of it into the shared file
+in a single read-modify-write (`claim.py flush-timings --timings-dir`). It
+runs unconditionally (`if: always()`) and independently of
+`verify-complete`, since timing history only feeds *future* runs' queue
+ordering, never this run's correctness.
 
 This exists because the file is shared and *not* keyed by its own ref the
 way claims are (see "Locking") — a naive "every worker writes it after
@@ -234,7 +258,7 @@ fatal error able to kill an otherwise-healthy worker's claim loop mid-run
 (see `cmd_done`'s docstring in `scripts/claim.py`). Funneling every write
 through one job, once, doesn't just reduce that collision rate — it
 removes the concurrent-writer problem this file has entirely, since after
-`build`/`topup` finish there is nothing left running that could race
+`build` finishes there is nothing left running that could race
 `record-timings`'s own single write.
 `<output_basename>` here is the input's raw value, comma(s) and all when
 building more than one layer together (e.g. `state/timings/bins,roads.json`)
@@ -270,15 +294,24 @@ subsequent run.
 Each worker job stays well under GitHub's 6-hour job limit as long as
 leaf-level (not country-or-larger) regions dominate the queue, which is the
 point of taking Geofabrik's leaves rather than some coarser level. The
-realistic risk is a handful of workers hitting the time wall near the very
-end of a run while a few regions remain unclaimed — not every worker
+realistic risk is a handful of workers hitting the time wall — or crashing
+outright — near the very end of a run while a few regions remain unclaimed
+or stuck under a now-dead worker's `lock` (see "Locking") — not every worker
 processing a full 6 hours' worth of tiny regions, since the queue simply
-empties once every leaf is claimed. `check-complete` (see "Merge") checks
-for exactly this gap and, if regions remain, `topup` dispatches one bounded
-second worker round before `merge`, capped at 2 rounds total; the
-`verify-complete` job fails the run loudly if coverage is still incomplete
-after that, rather than letting `merge` silently publish a world layer with
-holes in it.
+empties once every leaf is claimed.
+
+There is deliberately no second, top-up claim-loop round to mop this up —
+kept to one round on purpose (see "Distribution"): `fail-fast: false` means
+one worker's bad ending never cancels the rest of the matrix, so the fleet
+as a whole keeps draining the queue regardless of any single worker's fate,
+and a stuck `lock` from the one worker that actually crashed mid-build
+costs only the region(s) it was holding, not the run (see "Locking" for
+that trade-off in full, and "Deliberately deferred" for the actual fix if
+it's ever needed). The
+`verify-complete` job (`if: always()`, so it still runs and reports
+correctly even if one `build` leg failed at the job level) fails the run
+loudly if any region is left neither `done` nor `failed`, rather than
+letting `merge` silently publish a world layer with holes in it.
 
 ## Multiple layers, one download
 
@@ -296,9 +329,9 @@ across profiles for the same reason; the mechanics differ (a Geofabrik
 optimization is identical.
 
 Concretely, one claimed region is one *shared* unit of work across every
-`output_basename` in the call: `claim-and-build` (the composite action
-`build`/`topup` both use) downloads the region's `.osm.pbf` once, then
-loops over the config/process/output_basename triples running tilemaker
+`output_basename` in the call: `claim-and-build` (the composite action the
+`build` job uses) downloads the region's `.osm.pbf` once, then loops over
+the config/process/output_basename triples running tilemaker
 against that same file, writing each layer's own
 `<region-id>--<output_basename>.mbtiles`. If any one of those tilemaker
 runs fails, the *whole* region is marked failed and retried as a whole
@@ -365,7 +398,7 @@ complicate every shard's engine now.
 
 ## Merge
 
-Three jobs, after the (possibly topped-up) claim-loop completes:
+Three jobs, after the claim-loop completes:
 
 1. **`verify-complete`**, once per run regardless of how many
    `output_basename`s are being built (completeness is a property of
@@ -501,7 +534,17 @@ separate, later, out-of-scope repo.
   blocks the run) and loosen only if real Geofabrik data makes that
   impractical.
 - Stale-claim reclaim for a worker that crashes mid-build without releasing
-  its `lock` — deliberately not built yet (see "Locking"); revisit if that
-  turns out to be a real, recurring problem rather than a theoretical one.
+  its `lock` — deliberately not built (see "Locking"). A bigger
+  `worker_count` does *not* fix this (it only helps a region that was never
+  claimed in time, not one already claimed and then abandoned), so this is
+  accepted as-is: a stuck lock costs the region(s) that one worker was
+  holding, and the run needs a manual rerun (e.g. via `region_scope`) to
+  pick those back up. The straightforward fix, if this turns out to be a
+  real, recurring problem rather than a theoretical one: after `build`
+  finishes, any leftover `lock` ref is *known* stale (every worker that
+  could hold one has already terminated, per the workflow's own `needs:`
+  graph), so a small cleanup step could safely delete them and dispatch one
+  bounded follow-up pass sized to just the leftover regions — not a full
+  second `worker_count`-sized fleet.
 - Release-vs-B2 size threshold default — caller-tunable input, no default
   chosen here since this repo builds no real layer to size it against.

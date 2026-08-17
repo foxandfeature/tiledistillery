@@ -8,12 +8,16 @@ name: TileDistillery pipeline (reusable)
 # region across every config in the list, same fetch/build split
 # TileAlchemist uses for its own multi-profile runs.
 #
-# prepare -> build (claim-loop matrix) -> check-complete -> topup
-# (conditional second claim-loop round) -> record-timings (always, single
-# writer for the run's whole timing history) -> verify-complete (hard
-# gate) -> merge (matrixed per output_basename) -> cleanup (always). Deliberately
-# does NOT publish anywhere (no GitHub Release, no B2 upload) — that's the
-# calling workflow's job, same separation as TileAlchemist's _pipeline.yml.
+# prepare -> build (single claim-loop matrix) -> record-timings (always,
+# single writer for the run's whole timing history) -> verify-complete
+# (hard gate) -> merge (matrixed per output_basename) -> cleanup (always).
+# One round, not two, kept simple on purpose (see docs/ARCHITECTURE.md
+# "Distribution"): a worker crashing mid-region or hitting its own time
+# wall costs that one region, not a second dispatch — every other worker in
+# the same matrix keeps draining the queue regardless (`fail-fast: false`).
+# Deliberately does NOT publish anywhere (no GitHub Release, no B2 upload)
+# — that's the calling workflow's job, same separation as TileAlchemist's
+# _pipeline.yml.
 #
 # State (claim refs + timing history) lives on the CALLING repo's own
 # `state` branch, never in this repo — see docs/ARCHITECTURE.md "State
@@ -46,7 +50,7 @@ on:
         required: true
         type: string
       worker_count:
-        description: 'How many parallel claim-loop workers to fan out into, per round (see docs/ARCHITECTURE.md "Distribution").'
+        description: 'How many parallel claim-loop workers to fan out into (see docs/ARCHITECTURE.md "Distribution"). With one claim-loop round (no topup), fail-fast: false is what absorbs a worker crashing or timing out — every other worker keeps draining the same queue.'
         required: false
         type: string
         default: "20"
@@ -150,8 +154,9 @@ jobs:
           output_basename: ${{ inputs.output_basename }}
 
       # A worker's whole run can legitimately claim nothing (queue already
-      # empty when it started), so a missing shard file here is expected,
-      # not a failure.
+      # empty when it started — see claim-and-build's own first-claim step,
+      # which skips the tilemaker image pull entirely in that case too), so
+      # a missing shard file here is expected, not a failure.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -171,90 +176,6 @@ jobs:
           path: timings-buffer.jsonl
           if-no-files-found: ignore
 
-  check-complete:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      remaining_count: ${{ steps.check.outputs.remaining_count }}
-    steps:
-      - name: Checkout tiledistillery
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: .tiledistillery
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - run: pip install -r .tiledistillery/scripts/requirements.txt
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: queue-manifest
-
-      - id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          RESULT=$(python .tiledistillery/scripts/finalize_check.py \
-            --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
-            --state-branch state --output-basename "${{ inputs.output_basename }}" \
-            --manifest queue-manifest.json)
-          echo "remaining_count=$(jq '.remaining | length' <<<"$RESULT")" >> "$GITHUB_OUTPUT"
-
-  # A safety net for the realistic edge case in docs/ARCHITECTURE.md
-  # "Worker job shape & the 6-hour limit": a handful of workers hitting
-  # their own time wall near the end of a run while a few regions remain
-  # unclaimed. Reuses the exact same manifest and worker_count; claim.py
-  # next already skips anything done/failed/still-locked, so no filtering
-  # is needed here. Capped at one round (two total, counting `build`).
-  topup:
-    needs: [prepare, check-complete]
-    if: ${{ success() && needs.check-complete.outputs.remaining_count != '0' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        worker: ${{ fromJson(needs.prepare.outputs.workers) }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: .tiledistillery
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: queue-manifest
-
-      - uses: ./.tiledistillery/.github/actions/claim-and-build
-        with:
-          config: ${{ inputs.config }}
-          process: ${{ inputs.process }}
-          output_basename: ${{ inputs.output_basename }}
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: shards-topup-${{ matrix.worker }}
-          path: shards/*.mbtiles
-          if-no-files-found: ignore
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: timings-topup-${{ matrix.worker }}
-          path: timings-buffer.jsonl
-          if-no-files-found: ignore
-
   # Centralizes timing-history recording into a single writer for the whole
   # run, instead of every worker (or even every worker once) writing the
   # shared state/timings/<output_basename>.json itself — see
@@ -264,9 +185,11 @@ jobs:
   # of verify-complete: timing history only feeds *future* runs' queue
   # ordering, never this run's correctness, so it shouldn't gate merge/
   # publish, and runs unconditionally so a run that ultimately fails
-  # verify-complete still keeps whatever timing data it produced.
+  # verify-complete still keeps whatever timing data it produced. `if:
+  # always()` also means one failed `build` matrix leg doesn't cost every
+  # other, healthy leg's timing data.
   record-timings:
-    needs: [build, topup]
+    needs: build
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -291,7 +214,7 @@ jobs:
       # merge-multiple, download-artifact keeps each artifact in its own
       # subdirectory named after it, which is all flush-timings needs since
       # it searches --timings-dir recursively.
-      - name: Download every worker's timing buffer, both rounds
+      - name: Download every worker's timing buffer
         uses: actions/download-artifact@v4
         with:
           pattern: timings-*
@@ -307,14 +230,16 @@ jobs:
             --state-branch state --output-basename "${{ inputs.output_basename }}" \
             --timings-dir timings
 
-  # The hard gate, run once regardless of how many output_basenames are
-  # being built together — completeness is a property of *regions*, which
-  # are claimed once per call, not per output_basename (see
-  # docs/ARCHITECTURE.md "Locking"). Fails loudly rather than letting
-  # `merge` silently publish a world layer with holes in it (see
-  # docs/ARCHITECTURE.md "Merge").
+  # The hard gate — completeness is a property of *regions*, which are
+  # claimed once per call, not per output_basename (see docs/ARCHITECTURE.md
+  # "Locking"). Fails loudly rather than letting `merge` silently publish a
+  # world layer with holes in it (see docs/ARCHITECTURE.md "Merge"). `if:
+  # always()` so this still runs (and correctly reports/fails) even when one
+  # or more `build` matrix legs failed at the job level — every worker that
+  # did finish has already recorded its claims on the state branch
+  # regardless of a sibling leg's own outcome.
   verify-complete:
-    needs: [check-complete, topup]
+    needs: build
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -360,7 +285,7 @@ jobs:
       matrix:
         basename: ${{ fromJson(needs.prepare.outputs.basenames) }}
     steps:
-      - name: Download every worker's shards (both rounds, every layer)
+      - name: Download every worker's shards, every layer
         uses: actions/download-artifact@v4
         with:
           pattern: shards-*
@@ -403,7 +328,7 @@ jobs:
           path: ${{ matrix.basename }}.pmtiles
 
   cleanup:
-    needs: [check-complete, topup, verify-complete, merge, record-timings]
+    needs: [verify-complete, merge, record-timings]
     if: always()
     runs-on: ubuntu-latest
     permissions:
