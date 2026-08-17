@@ -114,7 +114,19 @@ def cmd_next(args):
         # racing for the same region collide on this exact create — only
         # one can win (see ClaimState's docstring for why this must not
         # have a timestamp or any other varying component in it).
-        if not common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock", anchor_sha):
+        try:
+            won = common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock", anchor_sha)
+        except requests.RequestException as exc:
+            # A persistent GitHub outage (5xx/network trouble surviving
+            # common._request's own retries) shouldn't crash this worker,
+            # and shouldn't burn its retry budget again on every remaining
+            # candidate in the manifest either — nothing was claimed here,
+            # so stop scanning and report the same as an empty queue, the
+            # same "log and continue" treatment cmd_done/cmd_failed give
+            # this class of failure.
+            print(f"::warning::claim scan for {args.output_basename} aborted early: {exc}", file=sys.stderr)
+            break
+        if not won:
             continue  # lost the race for this one; try the next candidate
 
         print(json.dumps({"claimed": True, "region": region}))
