@@ -31,14 +31,37 @@ def fetch_index():
 
 # Geofabrik regional bundles that overlap finer extracts already covered
 # elsewhere in the tree, but whose `parent` field doesn't say so (see
-# effective_parent below for the general case this doesn't catch): these
-# US Census-region groupings (id, declared parent "north-america") sit
-# geographically on top of the individual `us/<state>` extracts, which
-# are also independent leaves — download-only convenience bundles Geofabrik
-# offers alongside the finer split, not a coarser tier of the same tree.
-# Nothing in the index marks that redundancy, so it's hardcoded here.
+# effective_parent below for the general case this doesn't catch) and
+# which index-v1.json itself has no flag for. Two groups, both download-only
+# convenience bundles layered on top of extracts that are also independent
+# leaves in their own right:
+#   - the US Census regions (us-midwest, ...): declared parent
+#     "north-america" instead of "us", so nothing marks them as sitting on
+#     top of the individual `us/<state>` extracts.
+#   - Geofabrik's own "Special Sub Regions" (alps, dach, ...): each
+#     continent's download page (e.g. download.geofabrik.de/europe.html)
+#     lists these separately under a "Special Sub Regions" heading —
+#     "outside of the usual administrative hierarchies and may duplicate
+#     data already contained in the other sub regions", in Geofabrik's own
+#     words — but that grouping only exists in the HTML, not index-v1.json,
+#     so it's transcribed here by hand (checked against every continent
+#     page's `#specialsubregions` table).
+#   - "enfield" is a one-off third case, not either of the above: it's the
+#     *only* London borough Geofabrik publishes as its own leaf — every
+#     other borough (Camden, Westminster, Hackney, ...) is only available
+#     bundled in "greater-london" itself. `parent: "greater-london"` is
+#     correct, but it means the general "a referenced parent is coarser,
+#     drop it" rule below would silently exclude "greater-london" for
+#     having a child, without that one child covering anywhere near the
+#     whole area — the run would fetch tiny Enfield and quietly never
+#     fetch the rest of London at all. See find_leaves() for the other
+#     half of this fix (a redundant leaf must not keep shadowing its own
+#     parent).
 KNOWN_REDUNDANT_LEAVES = {
     "us-midwest", "us-northeast", "us-pacific", "us-south", "us-west",
+    "alps", "britain-and-ireland", "dach", "great-britain",
+    "south-africa-and-lesotho", "sea", "kaliningrad",
+    "enfield",
 }
 
 
@@ -92,7 +115,14 @@ def compute_paths(features):
 
 def find_leaves(features):
     by_id = {f["properties"]["id"]: f["properties"] for f in features}
-    parents_referenced = {effective_parent(gid, by_id) for gid in by_id}
+    # A redundant leaf (see KNOWN_REDUNDANT_LEAVES, e.g. "enfield") must not
+    # count towards making *its own parent* look non-leaf: if it did,
+    # excluding "enfield" would leave "greater-london" excluded too (still
+    # "referenced as a parent"), so neither ever gets fetched.
+    parents_referenced = {
+        effective_parent(gid, by_id) for gid in by_id
+        if gid not in KNOWN_REDUNDANT_LEAVES
+    }
     return [
         f for f in features
         if f["properties"]["id"] not in parents_referenced

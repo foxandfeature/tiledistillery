@@ -33,10 +33,6 @@ inputs:
     description: 'Local file this worker''s per-region durations are appended to (see cmd_done in scripts/claim.py). The calling job uploads it as an artifact; nothing in this action writes it to the shared state branch.'
     required: false
     default: timings-buffer.jsonl
-  ttl_seconds:
-    description: Stale-claim TTL passed through to claim.py next.
-    required: false
-    default: "5400"
 
 runs:
   using: composite
@@ -97,7 +93,7 @@ runs:
           CLAIM_JSON=$(python .tiledistillery/scripts/claim.py next \
             --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
             --state-branch state --output-basename "$OUTPUT_BASENAME" \
-            --manifest "${{ inputs.manifest }}" --ttl-seconds "${{ inputs.ttl_seconds }}")
+            --manifest "${{ inputs.manifest }}")
 
           CLAIMED=$(jq -r '.claimed' <<<"$CLAIM_JSON")
           if [ "$CLAIMED" != "true" ]; then
@@ -112,7 +108,15 @@ runs:
           echo "::group::${REGION_ID}"
           START=$(date +%s)
           set +e
-          curl -fsSL "$PBF_URL" -o region.osm.pbf
+          # --retry (with no --retry-all-errors) only retries curl's own
+          # notion of a *transient* failure — timeouts, connection resets,
+          # 5xx, 408/429 — and deliberately does not retry a 404 or other
+          # 4xx: that's Geofabrik telling us the region is genuinely gone,
+          # not a blip, so it should fall straight through to `claim.py
+          # failed` below instead of spending 5 attempts confirming the
+          # same absence. All retries happen here, on this same runner,
+          # before the region ever counts as a failed claim attempt.
+          curl -fsSL --retry 5 --retry-connrefused --retry-delay 2 "$PBF_URL" -o region.osm.pbf
           STATUS=$?
 
           # One fetch, every requested layer built against the same bytes

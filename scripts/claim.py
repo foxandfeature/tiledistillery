@@ -13,8 +13,17 @@ Subcommands, each printing one JSON object to stdout:
 
     claim.py next          --manifest queue-manifest.json ...        -> {"claimed": bool, "region": {...}|null}
     claim.py done          --region-id X --duration-seconds N ...
-    claim.py failed        --region-id X [--error MSG] ...           -> {"permanently_failed": bool, "attempt": int}
+    claim.py failed        --region-id X [--error MSG] ...           -> {"permanently_failed": true}
     claim.py flush-timings --timings-dir DIR ...                     -> {"flushed": int}
+
+`failed` is a single strike, not a retry counter: a region either finishes
+via `done` or is marked permanently `failed` the first time
+`claim-and-build` calls this after a build fails. Retrying transient
+failures (a flaky download) is the caller's job, on the same runner,
+*before* it ever calls `failed` — see the retry flags on `claim-and-build`'s
+own `curl` step — since retrying a genuinely broken region (bad Geofabrik
+data, a real 404) from here would just waste other workers' time on the
+same failure.
 
 `done` buffers its duration locally (--timings-buffer) rather than writing
 the shared timing-history file itself. `flush-timings` is run once, by a
@@ -28,7 +37,6 @@ import argparse
 import json
 import pathlib
 import sys
-import time
 
 import common
 import leaves
@@ -41,33 +49,29 @@ def scope_prefix(output_basename):
 class ClaimState:
     """Parsed view of every ref under one scope prefix.
 
-    Two refs per in-progress claim, not one: `.../lock` is a *fixed* name
-    per region — the actual mutex, since two workers racing for the same
-    region only collide (one 422s) if they're trying to create the exact
-    same ref name. `.../lock-at/<ts>` is a companion created immediately
-    after by whoever won `.../lock`, purely so a later sweep can tell how
-    old a claim is without reading any ref's pointed-to commit content —
-    it's never itself contested, since only the winner of `.../lock` ever
-    gets far enough to create it. (An earlier version put the timestamp
-    directly in the lock ref's own name, e.g. `.../lock/<ts>` — which
-    silently broke mutual exclusion: two workers claiming the same region
-    in different seconds would each create a *different*, non-colliding
-    ref name and both believe they'd won.)
+    `.../lock` is a *fixed* name per region — the actual mutex, since two
+    workers racing for the same region only collide (one 422s) if they're
+    trying to create the exact same ref name. There is no companion
+    timestamp ref and no staleness sweep: a lock is only ever released by
+    the worker that holds it, via `done` or `failed`. A worker that never
+    gets there (crashed, OOM-killed, hit the job time limit) leaves its
+    region's `lock` stuck for the rest of this run — accepted for now to
+    keep the state machine to three ref kinds; `cleanup_claims.py` wipes
+    everything at the end of every run regardless of how it went, so this
+    can't accumulate across runs.
     """
 
     def __init__(self, refs, prefix):
         self.lock_present = set()  # region_id
-        self.lock_at = {}          # region_id -> timestamp (best-effort, see sweep_stale)
         self.done = set()
         self.failed = set()
-        self.attempts = {}         # region_id -> set of attempt numbers
         for full_ref in refs:
             if not full_ref.startswith(prefix):
                 continue
             self._parse(full_ref[len(prefix):])
 
     def _parse(self, remainder):
-        # remainder is "<region/id/path>/lock" | ".../lock-at/<ts>" | ".../done" | ".../attempt/<n>" | ".../failed"
+        # remainder is "<region/id/path>/lock" | ".../done" | ".../failed"
         if remainder.endswith("/done"):
             self.done.add(remainder[: -len("/done")])
             return
@@ -77,35 +81,9 @@ class ClaimState:
         if remainder.endswith("/lock"):
             self.lock_present.add(remainder[: -len("/lock")])
             return
-        if "/lock-at/" in remainder:
-            region, _, ts = remainder.rpartition("/lock-at/")
-            self.lock_at[region] = int(ts)
-            return
-        if "/attempt/" in remainder:
-            region, _, n = remainder.rpartition("/attempt/")
-            self.attempts.setdefault(region, set()).add(int(n))
-            return
 
     def unavailable(self, region_id):
         return region_id in self.done or region_id in self.failed or region_id in self.lock_present
-
-    def attempt_count(self, region_id):
-        return len(self.attempts.get(region_id, ()))
-
-
-MAX_ATTEMPTS = 3
-
-# cmd_next creates `.../lock` and `.../lock-at/<ts>` as two separate API
-# calls, not one atomic write (see ClaimState's docstring for why they
-# can't be merged into a single ref). A concurrent worker's sweep_stale,
-# reading state in the gap between those two calls, sees a lock with no
-# lock-at and — absent this grace period — would mistake a claim that's
-# still being established for one that crashed mid-claim, stealing it out
-# from under the worker that's still building. Comfortably longer than one
-# API round trip so a live claimant's lock-at almost always shows up
-# before the recheck; not a guarantee under sustained rate-limit backoff
-# in _request, just a large reduction in how often this races.
-_STALE_LOCK_GRACE_SECONDS = 10
 
 
 def load_state(repo, token, scope):
@@ -117,62 +95,6 @@ def region_key_of(region_id):
     return "/".join(common.sanitize_ref_component(p) for p in region_id.split("/"))
 
 
-def sweep_stale(repo, token, scope, state, ttl_seconds, now, anchor_sha):
-    """Releases locks older than the TTL and records the attempt, so a
-    crashed worker's claim becomes reclaimable without a separate job. A
-    lock with no `lock-at` ref at all is *not* swept on sight — see
-    _STALE_LOCK_GRACE_SECONDS — it's given one grace-period wait and a
-    fresh re-read; only what's still lock-at-less after that is treated as
-    a crash landed between creating the two, and leaving it locked forever
-    would be worse than an extra attempt.
-
-    One region's release is skipped, not raised, on an unexpected failure
-    (for example a persistent GitHub API error): the lock ref for that
-    region is left untouched, so a later sweep just retries it. Raising
-    here would abort the whole caller (`next`/`failed`), which crashes
-    that worker's claim loop entirely and leaves every other stale lock in
-    this batch unreleased too, and leaves this region's own lock stuck
-    forever since the delete never even runs."""
-    grace_candidates = [
-        region_key for region_key in state.lock_present
-        if state.lock_at.get(region_key) is None
-    ]
-    if grace_candidates:
-        time.sleep(_STALE_LOCK_GRACE_SECONDS)
-        refreshed = load_state(repo, token, scope)
-        for region_key in grace_candidates:
-            if region_key in refreshed.lock_at:
-                state.lock_at[region_key] = refreshed.lock_at[region_key]
-            elif region_key not in refreshed.lock_present:
-                # Resolved (done/failed/reclaimed) between our two reads —
-                # nothing for this pass to release; a later sweep will
-                # judge whatever's there by then on its own merits.
-                state.lock_present.discard(region_key)
-
-    for region_key in list(state.lock_present):
-        ts = state.lock_at.get(region_key)
-        if ts is not None and now - ts <= ttl_seconds:
-            continue
-        try:
-            _release_and_record_attempt(repo, token, scope, region_key, state, anchor_sha)
-        except Exception as exc:
-            print(f"::warning::failed to sweep stale claim for {region_key}: {exc}", file=sys.stderr)
-
-
-def _release_and_record_attempt(repo, token, scope, region_key, state, anchor_sha):
-    n = state.attempt_count(region_key) + 1
-    common.create_ref(repo, token, f"claims/{scope}/{region_key}/attempt/{n}", anchor_sha)
-    common.delete_ref(repo, token, f"claims/{scope}/{region_key}/lock")
-    ts = state.lock_at.pop(region_key, None)
-    if ts is not None:
-        common.delete_ref(repo, token, f"claims/{scope}/{region_key}/lock-at/{ts}")
-    state.lock_present.discard(region_key)
-    state.attempts.setdefault(region_key, set()).add(n)
-    if n >= MAX_ATTEMPTS:
-        common.create_ref(repo, token, f"claims/{scope}/{region_key}/failed", anchor_sha)
-        state.failed.add(region_key)
-
-
 def cmd_next(args):
     anchor_sha = common.ensure_branch(args.repo, args.token, args.state_branch)
 
@@ -181,7 +103,6 @@ def cmd_next(args):
 
     scope = scope_prefix(args.output_basename)
     state = load_state(args.repo, args.token, scope)
-    sweep_stale(args.repo, args.token, scope, state, args.ttl_seconds, int(time.time()), anchor_sha)
 
     for region in manifest["regions"]:
         region_key = region_key_of(region["id"])
@@ -194,10 +115,6 @@ def cmd_next(args):
         if not common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock", anchor_sha):
             continue  # lost the race for this one; try the next candidate
 
-        # Having won, record *when* purely for staleness bookkeeping later.
-        # No race here: only the winner of the create above ever reaches
-        # this line, so this create can't collide with anything.
-        common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock-at/{int(time.time())}", anchor_sha)
         print(json.dumps({"claimed": True, "region": region}))
         return
 
@@ -208,13 +125,9 @@ def cmd_done(args):
     anchor_sha = common.ensure_branch(args.repo, args.token, args.state_branch)
     scope = scope_prefix(args.output_basename)
     region_key = region_key_of(args.region_id)
-    state = load_state(args.repo, args.token, scope)
 
     common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/done", anchor_sha)
     common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock")
-    ts = state.lock_at.get(region_key)
-    if ts is not None:
-        common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock-at/{ts}")
 
     # Duration goes to a local, per-worker file, not straight to the shared
     # state/timings/<output_basename>.json — a worker claims tens of regions
@@ -292,14 +205,13 @@ def cmd_flush_timings(args):
 def cmd_failed(args):
     anchor_sha = common.ensure_branch(args.repo, args.token, args.state_branch)
     scope = scope_prefix(args.output_basename)
-    state = load_state(args.repo, args.token, scope)
     region_key = region_key_of(args.region_id)
 
-    _release_and_record_attempt(args.repo, args.token, scope, region_key, state, anchor_sha)
-    n = state.attempt_count(region_key)
+    common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/failed", anchor_sha)
+    common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock")
     if args.error:
-        print(f"::warning::{args.region_id} attempt {n} failed: {args.error}", file=sys.stderr)
-    print(json.dumps({"permanently_failed": region_key in state.failed, "attempt": n}))
+        print(f"::warning::{args.region_id} failed: {args.error}", file=sys.stderr)
+    print(json.dumps({"permanently_failed": True}))
 
 
 def _add_common_args(p):
@@ -316,7 +228,6 @@ def main():
     p_next = sub.add_parser("next")
     _add_common_args(p_next)
     p_next.add_argument("--manifest", required=True)
-    p_next.add_argument("--ttl-seconds", type=int, default=5400)
     p_next.set_defaults(func=cmd_next)
 
     p_done = sub.add_parser("done")

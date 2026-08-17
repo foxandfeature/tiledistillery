@@ -36,6 +36,25 @@ leaf." Leaves are not merged or split any further; an oversized leaf (Russia)
 and a tiny one (Vatican) are both single, indivisible units of work (see
 "Timing history" for how that asymmetry is handled).
 
+`find_leaves()` also drops a hardcoded `KNOWN_REDUNDANT_LEAVES` set, for
+three distinct reasons `index-v1.json` gives no flag for — see the comment
+above that set in `leaves.py` for the full reasoning and sources:
+
+- the US Census regions (declared parent `north-america` instead of `us`,
+  so nothing marks them as sitting on top of the individual `us/<state>`
+  extracts);
+- Geofabrik's own explicitly labeled "Special Sub Regions" (`dach`, `alps`,
+  ...), which would otherwise get claimed and built as a "leaf" in its own
+  right even though, e.g., `germany`, `austria`, and `switzerland` already
+  cover the same ground as `dach`;
+- `enfield`, the one London borough Geofabrik happens to publish as its own
+  extract while every other borough is only available inside
+  `greater-london` itself — left in, the general "a referenced parent is
+  coarser, drop it" rule would exclude `greater-london` for having a child,
+  and the run would fetch tiny Enfield while silently never fetching the
+  rest of London at all. `find_leaves()` has to special-case this one the
+  other way: a redundant leaf must not keep shadowing its own parent.
+
 ## Distribution: dynamic claim queue, not a static matrix
 
 A static `strategy: matrix` over ~hundreds of leaves would technically run
@@ -124,39 +143,43 @@ of this put the claim timestamp directly in the lock ref's name, e.g.
 two workers claiming the same region a second apart would each create a
 *different*, non-colliding ref name, and both would believe they'd won.)
 
-Rather than encoding claim metadata (status, timestamp, attempt count) in
-the pointed-to commit's content — which would cost extra API round-trips to
-read back for every sweep — that metadata lives directly in ref names, so
-listing refs under the scope prefix once
-(`GET /git/matching-refs/claims/<scope>`) is enough to know the full state:
+Rather than encoding claim metadata (status, timestamp) in the pointed-to
+commit's content — which would cost extra API round-trips to read back —
+that metadata lives directly in ref names, so listing refs under the scope
+prefix once (`GET /git/matching-refs/claims/<scope>`) is enough to know the
+full state. Deliberately three ref kinds only, no timestamps or attempt
+counters:
 
 - **Claiming**: create `.../<region-id>/lock` (atomic; loses the race →
-  422 → try the next candidate). Having won, the same worker then creates
-  a *second*, companion ref, `.../<region-id>/lock-at/<unix-timestamp>` —
-  purely so a later sweep can tell how old the claim is from the ref name
-  alone. This second create is never itself contested: only the worker
-  that just won `.../lock` ever reaches it. Every ref points at the state
-  branch's current tip commit — the commit content is irrelevant, only
-  each ref's existence and name matter, so no extra blob/tree/commit needs
+  422 → try the next candidate). Every ref points at the state branch's
+  current tip commit — the commit content is irrelevant, only each ref's
+  existence and name matter, so no extra blob/tree/commit needs
   constructing per claim.
-- **Done**: create `.../<region-id>/done` and delete both `.../lock` and
-  `.../lock-at/*` (no race on any of this — only *creating* a
-  not-yet-existing ref is contested; deleting refs a worker's own claim
-  already owns isn't).
-- **Failed**: create `.../<region-id>/attempt/<n>` and delete
-  `.../lock` + `.../lock-at/*`; past 3 attempts, also create
-  `.../<region-id>/failed` and stop reclaiming it — a permanently-stuck
-  region needs a human, not more retries.
-- **Stale reclaim**: before claiming a *new* region, a worker sweeps
-  existing `.../lock` refs in scope for a `lock-at` companion older than a
-  TTL (a generous flat ceiling, e.g. 90 minutes, until real per-region
-  timing data suggests a tighter one) — or *missing* entirely, which is
-  treated as stale immediately rather than un-reclaimable, since a crash
-  landing between the two creates is exactly the kind of thing this sweep
-  exists to recover from. Releases it and records an `attempt/<n>`, the
-  same as an explicit failure. This makes crash recovery (a worker's job
-  cancelled or OOM-killed mid-build, never reaching `done`) self-healing
-  through the normal claim loop, with no separate sweep job.
+- **Done**: create `.../<region-id>/done` and delete `.../lock` (no race on
+  any of this — only *creating* a not-yet-existing ref is contested;
+  deleting a ref a worker's own claim already owns isn't).
+- **Failed**: create `.../<region-id>/failed` and delete `.../lock` — a
+  single strike, not a retry counter. `claim-and-build`'s own build loop
+  only calls this after it's already exhausted the *retryable* case itself
+  (a `curl --retry`-covered transient download failure, retried on the same
+  runner before the region ever counts as a claim attempt at all); anything
+  that reaches `claim.py failed` is treated as permanent immediately —
+  no more retries, since retrying a genuinely broken region (bad Geofabrik
+  data, a real 404) would just waste other workers' time on the same
+  failure.
+
+There is deliberately no staleness sweep or crash-reclaim: a `lock` is only
+ever released by the worker that holds it, via `done` or `failed`. A worker
+that never gets there (job cancelled, OOM-killed, or hits the time limit
+mid-build) leaves that one region's `lock` stuck for the rest of the run —
+`topup` cannot pick it up. Accepted for now to keep the state machine this
+small; `cleanup_claims.py` wipes every ref under the scope prefix at the end
+of the run regardless of how it went (see below), so a stuck lock can't
+outlive the run it happened in, and the practical cost is that one run needs
+a manual retry rather than self-healing through a second `topup` round. A
+TTL-based sweep is the obvious way back to that self-healing if a stuck
+worker turns out to be a real, recurring problem in practice — deliberately
+not built preemptively.
 
 Why refs and not, say, a shared `queue.json` committed to the state branch:
 every worker touching the same file still races at the branch-tip level
@@ -377,11 +400,9 @@ in `foxandfeature/tiledistillery`. Holds only:
 | Path | What | Written by |
 |---|---|---|
 | `state/timings/<output_basename>.json` | last ≤5 durations per region-id, persists across runs | each worker, on `done` |
-| `refs/claims/<output_basename>/<region-id>/lock` | in-progress claim, the actual mutex (fixed name — see "Locking") | claimed on create, deleted on done/failed/stale-reclaim |
-| `refs/claims/<output_basename>/<region-id>/lock-at/<ts>` | companion to `lock`, claim age for staleness sweeps | created right after `lock`, deleted alongside it |
+| `refs/claims/<output_basename>/<region-id>/lock` | in-progress claim, the actual mutex (fixed name — see "Locking") | claimed on create, deleted on done/failed |
 | `refs/claims/<output_basename>/<region-id>/done` | completed this run | claim/done step |
-| `refs/claims/<output_basename>/<region-id>/attempt/<n>` | one per failed/stale attempt | reclaim sweep or explicit failure |
-| `refs/claims/<output_basename>/<region-id>/failed` | exhausted 3 attempts | reclaim sweep, surfaced to finalize |
+| `refs/claims/<output_basename>/<region-id>/failed` | permanently failed (single strike — see "Locking") | explicit failure, surfaced to finalize |
 
 All of the above under one run's scope prefix is deleted at the end of that
 run (see "Merge" step 5) except the timings file, which is what's meant to
@@ -479,7 +500,8 @@ separate, later, out-of-scope repo.
   tuning question, not an architectural one; start strict (any failed leaf
   blocks the run) and loosen only if real Geofabrik data makes that
   impractical.
-- Exact stale-claim TTL (currently a flat placeholder) — revisit once real
-  per-region timing data exists to set a tighter, per-region-aware bound.
+- Stale-claim reclaim for a worker that crashes mid-build without releasing
+  its `lock` — deliberately not built yet (see "Locking"); revisit if that
+  turns out to be a real, recurring problem rather than a theoretical one.
 - Release-vs-B2 size threshold default — caller-tunable input, no default
   chosen here since this repo builds no real layer to size it against.
