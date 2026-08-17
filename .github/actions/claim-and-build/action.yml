@@ -22,6 +22,9 @@ inputs:
   output_basename:
     description: 'Base name(s) for the output .pmtiles file(s), matched 1:1 with config/process. Also the claim/timing-history scope key, taken verbatim — see docs/ARCHITECTURE.md "Locking".'
     required: true
+  round:
+    description: 'Which claim-loop round this is calling from ("build" or "topup") — scopes claim.py''s lock ref name so a region whose build-round lock was never released (crashed/OOM-killed/timed-out worker) is reclaimable by topup instead of stuck for the rest of the run. See docs/ARCHITECTURE.md "Locking".'
+    required: true
   manifest:
     description: Path to the queue-manifest.json produced by the prepare job.
     required: false
@@ -68,6 +71,7 @@ runs:
         CONFIG: ${{ inputs.config }}
         PROCESS: ${{ inputs.process }}
         OUTPUT_BASENAME: ${{ inputs.output_basename }}
+        ROUND: ${{ inputs.round }}
       run: |
         set -euo pipefail
         mkdir -p "${{ inputs.shards_dir }}"
@@ -93,6 +97,7 @@ runs:
           CLAIM_JSON=$(python .tiledistillery/scripts/claim.py next \
             --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
             --state-branch state --output-basename "$OUTPUT_BASENAME" \
+            --round "$ROUND" \
             --manifest "${{ inputs.manifest }}")
 
           CLAIMED=$(jq -r '.claimed' <<<"$CLAIM_JSON")
@@ -154,6 +159,7 @@ runs:
             python .tiledistillery/scripts/claim.py done \
               --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
               --state-branch state --output-basename "$OUTPUT_BASENAME" \
+              --round "$ROUND" \
               --region-id "$REGION_ID" \
               --duration-seconds "$((END - START))" \
               --timings-buffer "$TIMINGS_BUFFER"
@@ -170,6 +176,7 @@ runs:
             python .tiledistillery/scripts/claim.py failed \
               --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
               --state-branch state --output-basename "$OUTPUT_BASENAME" \
+              --round "$ROUND" \
               --region-id "$REGION_ID" \
               --error "build failed (exit ${STATUS})"
           fi

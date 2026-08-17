@@ -136,12 +136,18 @@ race, unlike a shared-file queue that every worker reads-modifies-writes
 (that needs its own retry-on-conflict loop for every claim, not just
 contended ones). But that atomicity only holds if the ref *name* being
 created is identical for every worker racing over the same region — so the
-lock ref itself must have a **fixed name per region**, with no timestamp or
-other varying component in it: `.../<region-id>/lock`. (An earlier version
-of this put the claim timestamp directly in the lock ref's name, e.g.
+lock ref itself must have a **fixed name per region per round**, with no
+timestamp or other per-attempt component in it: `.../<region-id>/lock/<round>`,
+where `<round>` is `build` or `topup` (`_pipeline.yml`'s two claim-loop
+rounds — see "Worker job shape & the 6-hour limit"). (An earlier version of
+this put the claim timestamp directly in the lock ref's name, e.g.
 `.../lock/<unix-timestamp>`, which silently defeats the whole mechanism:
 two workers claiming the same region a second apart would each create a
-*different*, non-colliding ref name, and both would believe they'd won.)
+*different*, non-colliding ref name, and both would believe they'd won. The
+round suffix is not that: it's one of exactly two values fixed ahead of
+time and shared by every worker in that round, so workers racing the same
+region within a round still collide on the identical ref name exactly as
+before.)
 
 Rather than encoding claim metadata (status, timestamp) in the pointed-to
 commit's content — which would cost extra API round-trips to read back —
@@ -150,16 +156,16 @@ prefix once (`GET /git/matching-refs/claims/<scope>`) is enough to know the
 full state. Deliberately three ref kinds only, no timestamps or attempt
 counters:
 
-- **Claiming**: create `.../<region-id>/lock` (atomic; loses the race →
-  422 → try the next candidate). Every ref points at the state branch's
-  current tip commit — the commit content is irrelevant, only each ref's
-  existence and name matter, so no extra blob/tree/commit needs
+- **Claiming**: create `.../<region-id>/lock/<round>` (atomic; loses the
+  race → 422 → try the next candidate). Every ref points at the state
+  branch's current tip commit — the commit content is irrelevant, only each
+  ref's existence and name matter, so no extra blob/tree/commit needs
   constructing per claim.
-- **Done**: create `.../<region-id>/done` and delete `.../lock` (no race on
-  any of this — only *creating* a not-yet-existing ref is contested;
-  deleting a ref a worker's own claim already owns isn't).
-- **Failed**: create `.../<region-id>/failed` and delete `.../lock` — a
-  single strike, not a retry counter. `claim-and-build`'s own build loop
+- **Done**: create `.../<region-id>/done` and delete `.../lock/<round>` (no
+  race on any of this — only *creating* a not-yet-existing ref is
+  contested; deleting a ref a worker's own claim already owns isn't).
+- **Failed**: create `.../<region-id>/failed` and delete `.../lock/<round>`
+  — a single strike, not a retry counter. `claim-and-build`'s own build loop
   only calls this after it's already exhausted the *retryable* case itself
   (a `curl --retry`-covered transient download failure, retried on the same
   runner before the region ever counts as a claim attempt at all); anything
@@ -168,18 +174,27 @@ counters:
   data, a real 404) would just waste other workers' time on the same
   failure.
 
-There is deliberately no staleness sweep or crash-reclaim: a `lock` is only
-ever released by the worker that holds it, via `done` or `failed`. A worker
-that never gets there (job cancelled, OOM-killed, or hits the time limit
-mid-build) leaves that one region's `lock` stuck for the rest of the run —
-`topup` cannot pick it up. Accepted for now to keep the state machine this
-small; `cleanup_claims.py` wipes every ref under the scope prefix at the end
-of the run regardless of how it went (see below), so a stuck lock can't
-outlive the run it happened in, and the practical cost is that one run needs
-a manual retry rather than self-healing through a second `topup` round. A
-TTL-based sweep is the obvious way back to that self-healing if a stuck
-worker turns out to be a real, recurring problem in practice — deliberately
-not built preemptively.
+There is deliberately no staleness sweep, timestamp, or attempt counter on
+`lock` itself — within a single round, it is only ever released by the
+worker that holds it, via `done` or `failed`, exactly as before. What the
+round suffix buys, for free, is crash-reclaim *across* rounds: `topup` only
+ever starts once every `build`-round worker has already terminated one way
+or another (`check-complete`, which `topup` depends on, itself
+`needs: build` — the workflow's own job-dependency graph is the liveness
+check here, not a TTL). So a `lock/build` ref still present when `topup`
+begins can only belong to a worker that crashed, got OOM-killed, or hit the
+job time limit mid-build (see "Worker job shape & the 6-hour limit") — never
+a worker `topup` could actually be racing. `topup` runs its claim loop with
+`--round topup`, so `unavailable()` only ever checks `lock/topup`; a
+leftover `lock/build` doesn't block it. A region can be `done`/`failed` at
+most once overall (those two ref kinds aren't round-scoped), but "locked"
+independently, at most once each, under `build` and under `topup`. This
+still doesn't self-heal *within* one round — a worker that crashes mid-build
+during `topup` itself leaves `lock/topup` stuck for the rest of the run —
+but the pipeline is capped at two rounds by design, so there's no third
+round left for that to matter to. Either way, `cleanup_claims.py` wipes
+every ref under the scope prefix at the end of the run regardless of how it
+went (see below), so a stuck lock never outlives the run it happened in.
 
 Why refs and not, say, a shared `queue.json` committed to the state branch:
 every worker touching the same file still races at the branch-tip level
@@ -270,15 +285,18 @@ subsequent run.
 Each worker job stays well under GitHub's 6-hour job limit as long as
 leaf-level (not country-or-larger) regions dominate the queue, which is the
 point of taking Geofabrik's leaves rather than some coarser level. The
-realistic risk is a handful of workers hitting the time wall near the very
-end of a run while a few regions remain unclaimed — not every worker
-processing a full 6 hours' worth of tiny regions, since the queue simply
-empties once every leaf is claimed. `check-complete` (see "Merge") checks
-for exactly this gap and, if regions remain, `topup` dispatches one bounded
-second worker round before `merge`, capped at 2 rounds total; the
-`verify-complete` job fails the run loudly if coverage is still incomplete
-after that, rather than letting `merge` silently publish a world layer with
-holes in it.
+realistic risk is a handful of workers hitting the time wall — or crashing
+outright — near the very end of a run while a few regions remain unclaimed
+or stuck under a now-dead worker's `lock/build` (see "Locking") — not every
+worker processing a full 6 hours' worth of tiny regions, since the queue
+simply empties once every leaf is claimed. `check-complete` (see "Merge")
+checks for exactly this gap and, if regions remain, `topup` dispatches one
+bounded second worker round before `merge`, capped at 2 rounds total;
+`check-complete` itself runs with `if: always()` specifically so one bad
+`build` leg doesn't skip this safety net for every other, healthy leg's
+leftover work. The `verify-complete` job fails the run loudly if coverage is
+still incomplete after that, rather than letting `merge` silently publish a
+world layer with holes in it.
 
 ## Multiple layers, one download
 
@@ -400,7 +418,7 @@ in `foxandfeature/tiledistillery`. Holds only:
 | Path | What | Written by |
 |---|---|---|
 | `state/timings/<output_basename>.json` | last ≤5 durations per region-id, persists across runs | each worker, on `done` |
-| `refs/claims/<output_basename>/<region-id>/lock` | in-progress claim, the actual mutex (fixed name — see "Locking") | claimed on create, deleted on done/failed |
+| `refs/claims/<output_basename>/<region-id>/lock/<round>` | in-progress claim for that round, the actual mutex (fixed name per round — see "Locking") | claimed on create, deleted on done/failed |
 | `refs/claims/<output_basename>/<region-id>/done` | completed this run | claim/done step |
 | `refs/claims/<output_basename>/<region-id>/failed` | permanently failed (single strike — see "Locking") | explicit failure, surfaced to finalize |
 
@@ -500,8 +518,13 @@ separate, later, out-of-scope repo.
   tuning question, not an architectural one; start strict (any failed leaf
   blocks the run) and loosen only if real Geofabrik data makes that
   impractical.
-- Stale-claim reclaim for a worker that crashes mid-build without releasing
-  its `lock` — deliberately not built yet (see "Locking"); revisit if that
-  turns out to be a real, recurring problem rather than a theoretical one.
+- Stale-claim reclaim *within* a single round, for a worker that crashes
+  mid-build without releasing its `lock/<round>` — closed *across* rounds by
+  scoping the lock ref by round (see "Locking"), since `topup` can safely
+  treat a leftover `lock/build` as dead without a TTL or liveness check. A
+  worker crashing mid-build *during* `topup` itself is still unreclaimed,
+  since there's no third round to pick it up — deliberately not built out
+  further; revisit if that turns out to be a real, recurring problem rather
+  than a theoretical one.
 - Release-vs-B2 size threshold default — caller-tunable input, no default
   chosen here since this repo builds no real layer to size it against.

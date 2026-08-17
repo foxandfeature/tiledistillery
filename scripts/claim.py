@@ -11,10 +11,14 @@ is always enough to reconstruct it.
 
 Subcommands, each printing one JSON object to stdout:
 
-    claim.py next          --manifest queue-manifest.json ...        -> {"claimed": bool, "region": {...}|null}
-    claim.py done          --region-id X --duration-seconds N ...
-    claim.py failed        --region-id X [--error MSG] ...           -> {"permanently_failed": true}
-    claim.py flush-timings --timings-dir DIR ...                     -> {"flushed": int}
+    claim.py next          --round build|topup --manifest queue-manifest.json ...  -> {"claimed": bool, "region": {...}|null}
+    claim.py done          --round build|topup --region-id X --duration-seconds N ...
+    claim.py failed        --round build|topup --region-id X [--error MSG] ...     -> {"permanently_failed": true}
+    claim.py flush-timings --timings-dir DIR ...                                   -> {"flushed": int}
+
+`--round` (`next`/`done`/`failed` only) says which of `_pipeline.yml`'s two
+claim-loop rounds is calling — see ClaimState's docstring for why the lock
+ref itself is scoped by round.
 
 `failed` is a single strike, not a retry counter: a region either finishes
 via `done` or is marked permanently `failed` the first time
@@ -51,20 +55,27 @@ def scope_prefix(output_basename):
 class ClaimState:
     """Parsed view of every ref under one scope prefix.
 
-    `.../lock` is a *fixed* name per region — the actual mutex, since two
-    workers racing for the same region only collide (one 422s) if they're
-    trying to create the exact same ref name. There is no companion
-    timestamp ref and no staleness sweep: a lock is only ever released by
-    the worker that holds it, via `done` or `failed`. A worker that never
-    gets there (crashed, OOM-killed, hit the job time limit) leaves its
-    region's `lock` stuck for the rest of this run — accepted for now to
-    keep the state machine to three ref kinds; `cleanup_claims.py` wipes
-    everything at the end of every run regardless of how it went, so this
-    can't accumulate across runs.
+    `.../lock/<round>` is a *fixed* name per region **per round** ("build"
+    or "topup", see `_pipeline.yml`'s two claim-loop rounds) — the actual
+    mutex, since two workers racing for the same region *in the same round*
+    only collide (one 422s) if they're trying to create the exact same ref
+    name. Rounds run strictly sequentially — `topup` only starts once every
+    `build`-round job has already terminated, one way or another, per the
+    workflow's own `needs:` graph — so a `lock/build` ref still present when
+    `topup` starts can only mean its worker never reached `done`/`failed`
+    (crashed, OOM-killed, hit the job time limit) and is *guaranteed* dead by
+    now, not a live worker `topup` could race. Scoping the lock name by round
+    is what lets `topup` treat that as reclaimable without needing a
+    timestamp or any staleness sweep: it simply never looks at `lock/build`
+    at all, only `lock/topup`. There is still no companion timestamp ref
+    within a round — two workers in the *same* round remain a real race,
+    settled by the atomic ref-create exactly as before. `cleanup_claims.py`
+    wipes everything at the end of every run regardless of how it went, so a
+    stuck `lock/<round>` can't accumulate across runs either way.
     """
 
     def __init__(self, refs, prefix):
-        self.lock_present = set()  # region_id
+        self.lock_present = {}  # region_id -> set of round names
         self.done = set()
         self.failed = set()
         for full_ref in refs:
@@ -73,19 +84,24 @@ class ClaimState:
             self._parse(full_ref[len(prefix):])
 
     def _parse(self, remainder):
-        # remainder is "<region/id/path>/lock" | ".../done" | ".../failed"
+        # remainder is "<region/id/path>/lock/<round>" | ".../done" | ".../failed"
         if remainder.endswith("/done"):
             self.done.add(remainder[: -len("/done")])
             return
         if remainder.endswith("/failed"):
             self.failed.add(remainder[: -len("/failed")])
             return
-        if remainder.endswith("/lock"):
-            self.lock_present.add(remainder[: -len("/lock")])
-            return
+        segments = remainder.split("/")
+        if len(segments) >= 2 and segments[-2] == "lock":
+            region_id = "/".join(segments[:-2])
+            self.lock_present.setdefault(region_id, set()).add(segments[-1])
 
-    def unavailable(self, region_id):
-        return region_id in self.done or region_id in self.failed or region_id in self.lock_present
+    def unavailable(self, region_id, round_name):
+        return (
+            region_id in self.done
+            or region_id in self.failed
+            or round_name in self.lock_present.get(region_id, ())
+        )
 
 
 def load_state(repo, token, scope):
@@ -108,13 +124,14 @@ def cmd_next(args):
 
     for region in manifest["regions"]:
         region_key = region_key_of(region["id"])
-        if state.unavailable(region_key):
+        if state.unavailable(region_key, args.round):
             continue
-        # The actual race: a *fixed* ref name per region, so two workers
-        # racing for the same region collide on this exact create — only
-        # one can win (see ClaimState's docstring for why this must not
-        # have a timestamp or any other varying component in it).
-        if not common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock", anchor_sha):
+        # The actual race: a *fixed* ref name per region per round, so two
+        # workers racing for the same region in the same round collide on
+        # this exact create — only one can win (see ClaimState's docstring
+        # for why this must not have a timestamp or any other varying
+        # component in it, and why the round suffix is fine).
+        if not common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock/{args.round}", anchor_sha):
             continue  # lost the race for this one; try the next candidate
 
         print(json.dumps({"claimed": True, "region": region}))
@@ -141,7 +158,7 @@ def cmd_done(args):
     # its docstring — and still propagates.
     try:
         common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/done", anchor_sha)
-        common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock")
+        common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock/{args.round}")
     except requests.RequestException as exc:
         print(f"::warning::{args.region_id} done-marking failed, lock left stuck for this run: {exc}", file=sys.stderr)
 
@@ -228,7 +245,7 @@ def cmd_failed(args):
     # whole remaining queue.
     try:
         common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/failed", anchor_sha)
-        common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock")
+        common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock/{args.round}")
     except requests.RequestException as exc:
         print(f"::warning::{args.region_id} failed-marking failed, lock left stuck for this run: {exc}", file=sys.stderr)
     if args.error:
@@ -243,17 +260,28 @@ def _add_common_args(p):
     p.add_argument("--output-basename", required=True)
 
 
+def _add_round_arg(p):
+    p.add_argument(
+        "--round", required=True, choices=["build", "topup"],
+        help="Which claim-loop round this is (see _pipeline.yml). Scopes the lock "
+             "ref name so topup can reclaim a region whose build-round lock was "
+             "never released — see ClaimState's docstring.",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_next = sub.add_parser("next")
     _add_common_args(p_next)
+    _add_round_arg(p_next)
     p_next.add_argument("--manifest", required=True)
     p_next.set_defaults(func=cmd_next)
 
     p_done = sub.add_parser("done")
     _add_common_args(p_done)
+    _add_round_arg(p_done)
     p_done.add_argument("--region-id", required=True)
     p_done.add_argument("--duration-seconds", type=int, required=True)
     p_done.add_argument("--timings-buffer", required=True, help="Local file this worker's durations are appended to; see cmd_flush_timings.")
@@ -261,6 +289,7 @@ def main():
 
     p_failed = sub.add_parser("failed")
     _add_common_args(p_failed)
+    _add_round_arg(p_failed)
     p_failed.add_argument("--region-id", required=True)
     p_failed.add_argument("--error", default="")
     p_failed.set_defaults(func=cmd_failed)

@@ -148,6 +148,7 @@ jobs:
           config: ${{ inputs.config }}
           process: ${{ inputs.process }}
           output_basename: ${{ inputs.output_basename }}
+          round: build
 
       # A worker's whole run can legitimately claim nothing (queue already
       # empty when it started), so a missing shard file here is expected,
@@ -171,8 +172,19 @@ jobs:
           path: timings-buffer.jsonl
           if-no-files-found: ignore
 
+  # `if: always()` (not the default implicit `needs.build.result == 'success'`)
+  # deliberately lets this run even when one or more `build` matrix legs
+  # failed at the job level (crashed, OOM-killed, hit the 6-hour wall — see
+  # docs/ARCHITECTURE.md "Worker job shape & the 6-hour limit"): that is
+  # exactly the scenario `topup` exists to mop up, so gating check-complete
+  # on every worker's success would skip the one round meant to handle a
+  # worker *not* succeeding. Every worker that did finish (the vast
+  # majority, in the realistic case of one bad leg) has already reported
+  # its claims regardless of a sibling leg's outcome, since claim state
+  # lives on the state branch, not in this job's own success/failure.
   check-complete:
     needs: build
+    if: always()
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -208,10 +220,16 @@ jobs:
 
   # A safety net for the realistic edge case in docs/ARCHITECTURE.md
   # "Worker job shape & the 6-hour limit": a handful of workers hitting
-  # their own time wall near the end of a run while a few regions remain
-  # unclaimed. Reuses the exact same manifest and worker_count; claim.py
-  # next already skips anything done/failed/still-locked, so no filtering
-  # is needed here. Capped at one round (two total, counting `build`).
+  # their own time wall (or crashing outright) near the end of a run while
+  # a few regions remain unclaimed. Reuses the exact same manifest and
+  # worker_count; claim.py next already skips anything done/failed, and
+  # `round: topup` above means it also ignores any leftover `lock/build`
+  # ref — every `build`-round worker has already terminated by the time
+  # this job starts (see check-complete's `needs: build`), so a lock still
+  # sitting under `lock/build` can only be one its owner never released,
+  # never a live worker `topup` could actually race (see ClaimState's
+  # docstring in scripts/claim.py). Capped at one round (two total, counting
+  # `build`).
   topup:
     needs: [prepare, check-complete]
     if: ${{ success() && needs.check-complete.outputs.remaining_count != '0' }}
@@ -240,6 +258,7 @@ jobs:
           config: ${{ inputs.config }}
           process: ${{ inputs.process }}
           output_basename: ${{ inputs.output_basename }}
+          round: topup
 
       - uses: actions/upload-artifact@v4
         if: always()
