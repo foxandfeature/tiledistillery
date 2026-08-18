@@ -12,6 +12,7 @@ import base64
 import concurrent.futures
 import json
 import random
+import threading
 import time
 import urllib.parse
 
@@ -28,17 +29,48 @@ _API_VERSION = "2022-11-28"
 # regions are already done and most workers are simultaneously racing over
 # the few still left. Doubling from a 4s base (this is the GitHub API being
 # asked to recover, not this runner, same "give the other side room"
-# reasoning as the curl download retry) up to _BACKOFF_CAP_S; "full jitter"
-# (sleep a random amount in [0, backoff), not the backoff itself) keeps
-# retrying workers from re-colliding in lockstep on the next attempt, which
-# a fixed exponential delay would not.
+# reasoning as the curl download retry) up to _BACKOFF_CAP_S.
 _MAX_RETRIES = 8
 _BACKOFF_BASE_S = 4
 _BACKOFF_CAP_S = 60
 
+# _request is called from many threads at once (delete_refs' pool). A 403/429
+# hit by one thread almost always means every other thread in the same burst
+# is about to hit it too — GitHub's secondary rate limit wants a genuine
+# quiet period before it lifts, not just each caller's own request rate cut
+# in half. Per-thread "full jitter" backoff (sleep a random amount in
+# [0, backoff)) doesn't provide that: across N independently-jittering
+# threads it's near-certain that *someone's* next request lands within any
+# given fraction of a second, so the aggregate request rate never actually
+# drops to zero and the limit never clears — every thread just burns its own
+# retry budget in lockstep and still 403s at the end. A shared cooldown gate
+# fixes this: the first thread to see the signal makes *every* thread
+# (including ones about to start a fresh request) wait out the same window
+# together, so the API actually gets the quiet period it's asking for.
+_rate_limit_lock = threading.Lock()
+_rate_limit_until = 0.0
 
-def _backoff_sleep(attempt):
-    time.sleep(random.uniform(0, min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2 ** attempt))))
+
+def _await_rate_limit_gate():
+    while True:
+        with _rate_limit_lock:
+            remaining = _rate_limit_until - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(remaining)
+
+
+def _trip_rate_limit_gate(seconds):
+    global _rate_limit_until
+    with _rate_limit_lock:
+        _rate_limit_until = max(_rate_limit_until, time.monotonic() + seconds)
+
+
+def _backoff_seconds(attempt):
+    # A little jitter on top (not from zero) so threads released together
+    # don't all fire in the exact same instant, without reopening the
+    # near-zero-wait gap full jitter had.
+    return min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2 ** attempt)) + random.uniform(0, 1)
 
 
 def _headers(token):
@@ -75,11 +107,12 @@ def _request(method, path, token, **kwargs):
     url = f"{API_BASE}{path}"
     last_exc = None
     for attempt in range(_MAX_RETRIES):
+        _await_rate_limit_gate()
         try:
             resp = requests.request(method, url, headers=_headers(token), timeout=30, **kwargs)
         except requests.RequestException as exc:
             last_exc = exc
-            _backoff_sleep(attempt)
+            _trip_rate_limit_gate(_backoff_seconds(attempt))
             continue
         if resp.status_code == 403:
             message = _permission_denied_message(resp)
@@ -94,17 +127,17 @@ def _request(method, path, token, **kwargs):
         if resp.status_code in (403, 429) or resp.status_code >= 500:
             # GitHub's secondary-rate-limit responses often carry a
             # Retry-After (seconds) that's a more authoritative wait time
-            # than a blind guess — honor it, still jittered a little so a
-            # whole fleet released on the same limit doesn't retry in the
-            # exact same instant, but otherwise fall back to backoff.
+            # than a blind guess — honor it (still tripping the *shared*
+            # gate, not just sleeping this thread, so the rest of the pool
+            # actually goes quiet too), otherwise fall back to backoff.
             retry_after = resp.headers.get("Retry-After")
             if retry_after is not None:
                 try:
-                    time.sleep(float(retry_after) + random.uniform(0, 1))
+                    _trip_rate_limit_gate(float(retry_after) + random.uniform(0, 1))
                 except ValueError:
-                    _backoff_sleep(attempt)
+                    _trip_rate_limit_gate(_backoff_seconds(attempt))
             else:
-                _backoff_sleep(attempt)
+                _trip_rate_limit_gate(_backoff_seconds(attempt))
             continue
         return resp
     if last_exc is not None:
