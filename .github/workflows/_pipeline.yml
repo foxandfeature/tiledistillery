@@ -296,12 +296,32 @@ jobs:
           path: shards
           merge-multiple: true
 
-      # apt-get update has no built-in bound on a stalled mirror connection
-      # (seen hanging 20+ minutes against GitHub's default Azure mirror), so
-      # give it explicit per-request timeouts/retries and a step-level
+      # Cached so a healthy run's binary insulates every later run from the
+      # apt/Ubuntu-mirror flakiness below (seen hanging 20+ minutes against
+      # GitHub's default Azure mirror) — cache is only ever consulted, never
+      # required, so a first-ever miss just pays the normal install cost.
+      # Key rotates monthly so cached binaries don't drift from upstream
+      # forever; restore-keys falls back to the newest prior month's cache
+      # on a miss instead of forcing a rebuild every month-boundary run.
+      - name: Cache key date
+        id: cache-date
+        run: echo "date=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached tippecanoe binary
+        id: tippecanoe-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tippecanoe-bin
+          key: tippecanoe-bin-${{ runner.os }}-${{ steps.cache-date.outputs.date }}
+          restore-keys: |
+            tippecanoe-bin-${{ runner.os }}-
+
+      # apt-get update has no built-in bound on a stalled mirror connection,
+      # so give it explicit per-request timeouts/retries and a step-level
       # backstop — either lets it fail fast into the source-build fallback
       # below instead of eating the whole job's runtime.
       - name: Install tippecanoe
+        if: steps.tippecanoe-cache.outputs.cache-hit != 'true'
         timeout-minutes: 10
         run: |
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 update \
@@ -310,6 +330,11 @@ jobs:
             make -C /tmp/tippecanoe -j"$(nproc)"
             sudo make -C /tmp/tippecanoe install
           }
+          mkdir -p ~/.cache/tippecanoe-bin
+          cp "$(command -v tile-join)" ~/.cache/tippecanoe-bin/
+
+      - name: Add tippecanoe to PATH
+        run: echo "$HOME/.cache/tippecanoe-bin" >> "$GITHUB_PATH"
 
       - name: Merge this layer's shards into its final file
         env:
