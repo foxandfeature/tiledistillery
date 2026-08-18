@@ -25,19 +25,15 @@ def main():
     scope = claim.scope_prefix(args.output_basename)
     refs = common.list_matching_refs(args.repo, args.token, f"claims/{scope}")
 
-    failed = [r for r in refs if r.endswith("/failed")]
+    failed = [r["ref"] for r in refs if r["ref"].endswith("/failed")]
     if failed:
         print(f"::warning::{len(failed)} region(s) ended this run permanently failed:", file=sys.stderr)
         for r in failed:
             print(f"::warning::  {r}", file=sys.stderr)
 
-    skipped = []
-    for ref in refs:
-        try:
-            common.delete_ref(args.repo, args.token, ref[len("refs/"):])
-        except Exception as exc:
-            skipped.append(ref)
-            print(f"::warning::failed to delete {ref}: {exc}", file=sys.stderr)
+    skipped = common.delete_refs(args.repo, args.token, refs)
+    for ref, message in skipped:
+        print(f"::warning::failed to delete {ref}: {message}", file=sys.stderr)
 
     print(f"cleaned up {len(refs) - len(skipped)}/{len(refs)} claim ref(s) under {scope!r}", file=sys.stderr)
     if skipped:

@@ -76,7 +76,8 @@ class ClaimState:
         self.lock_present = set()  # region_id
         self.done = set()
         self.failed = set()
-        for full_ref in refs:
+        for entry in refs:
+            full_ref = entry["ref"]
             if not full_ref.startswith(prefix):
                 continue
             self._parse(full_ref[len(prefix):])

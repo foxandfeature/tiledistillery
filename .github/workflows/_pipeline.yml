@@ -8,9 +8,13 @@ name: TileDistillery pipeline (reusable)
 # region across every config in the list, same fetch/build split
 # TileAlchemist uses for its own multi-profile runs.
 #
-# prepare -> build (single claim-loop matrix) -> record-timings (always,
-# single writer for the run's whole timing history) -> verify-complete
-# (hard gate) -> merge (matrixed per output_basename) -> cleanup (always).
+# prepare -> build (single claim-loop matrix) -> verify-complete (hard
+# gate) -> cleanup (always), with record-timings (always, single writer for
+# the run's whole timing history) and merge (matrixed per output_basename)
+# both branching off in parallel afterward — merge off verify-complete,
+# record-timings off build directly. cleanup only waits on verify-complete
+# (the last job that still reads the claim refs), not on merge or
+# record-timings, since neither of those touches claim refs.
 # One round, not two, kept simple on purpose (see docs/ARCHITECTURE.md
 # "Distribution"): a worker crashing mid-region or hitting its own time
 # wall costs that one region, not a second dispatch — every other worker in
@@ -327,8 +331,15 @@ jobs:
           name: ${{ matrix.basename }}-pmtiles
           path: ${{ matrix.basename }}.pmtiles
 
+  # Only actually needs verify-complete: that's the last job that reads the
+  # claim refs (finalize_check.py's completeness check), so it's the only
+  # thing cleanup must wait behind. merge and record-timings never touch
+  # claim refs at all (shards/timings artifacts only), so gating cleanup on
+  # them too just delayed it for no reason — it now runs as soon as
+  # verify-complete finishes, in parallel with merge/record-timings instead
+  # of after them.
   cleanup:
-    needs: [verify-complete, merge, record-timings]
+    needs: verify-complete
     if: always()
     runs-on: ubuntu-latest
     permissions:

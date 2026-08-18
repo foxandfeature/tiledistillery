@@ -159,14 +159,62 @@ def delete_ref(repo, token, ref):
 
 
 def list_matching_refs(repo, token, prefix):
-    """prefix: without the leading 'refs/', e.g. 'claims'. Returns the full
-    'refs/...' name of every ref starting with 'refs/<prefix>/'."""
+    """prefix: without the leading 'refs/', e.g. 'claims'. Returns one
+    {"ref": "refs/...", "node_id": "..."} dict per ref starting with
+    'refs/<prefix>/'. node_id is the GraphQL global ID, carried along here
+    (the REST list response already includes it for free) so callers that
+    need to delete refs in bulk (see delete_refs) don't need a second
+    round-trip just to look it up."""
     quoted = urllib.parse.quote(prefix, safe="/")
     resp = _request("GET", f"/repos/{repo}/git/matching-refs/{quoted}", token)
     if resp.status_code == 404:
         return []
     resp.raise_for_status()
-    return [entry["ref"] for entry in resp.json()]
+    return [{"ref": entry["ref"], "node_id": entry["node_id"]} for entry in resp.json()]
+
+
+# GitHub's REST Git Refs API has no bulk-delete endpoint (DELETE .../git/refs/{ref}
+# is one ref per call), but the GraphQL API lets multiple aliased `deleteRef`
+# mutations ride in a single HTTP request/response. Batched rather than sent as
+# one giant request per cleanup run, to keep any single request's size bounded
+# and so trouble with one batch (a timeout, a transient 5xx) doesn't block every
+# other batch from still getting cleaned up.
+_GRAPHQL_DELETE_BATCH_SIZE = 50
+
+
+def delete_refs(repo, token, refs):
+    """refs: the list of {"ref", "node_id"} dicts from list_matching_refs.
+    Deletes them via batched GraphQL `deleteRef` mutations instead of one
+    REST DELETE per ref — see the module-level comment on
+    _GRAPHQL_DELETE_BATCH_SIZE for why. Best effort, same contract as
+    delete_ref: returns a list of (ref_name, error_message) for every ref
+    that failed to delete, for the caller to log and leave for a later
+    cleanup run rather than aborting the rest of this one over it."""
+    failed = []
+    for start in range(0, len(refs), _GRAPHQL_DELETE_BATCH_SIZE):
+        batch = refs[start:start + _GRAPHQL_DELETE_BATCH_SIZE]
+        mutations = "\n".join(
+            f'd{i}: deleteRef(input: {{refId: {json.dumps(entry["node_id"])}}}) {{ clientMutationId }}'
+            for i, entry in enumerate(batch)
+        )
+        try:
+            resp = _request("POST", "/graphql", token, json={"query": f"mutation {{\n{mutations}\n}}"})
+            resp.raise_for_status()
+            body = resp.json()
+        except requests.RequestException as exc:
+            failed.extend((entry["ref"], str(exc)) for entry in batch)
+            continue
+        # A GraphQL 200 can still carry per-field errors: each failed
+        # deleteRef alias shows up here with a "path" of ["d<i>"], the
+        # sibling aliases having already run and succeeded independently —
+        # mutation root fields execute serially but don't abort each other.
+        for err in body.get("errors", []):
+            path = err.get("path") or []
+            if not path:
+                continue
+            index = int(str(path[0])[1:])
+            failed.append((batch[index]["ref"], err.get("message", "unknown GraphQL error")))
+    return failed
 
 
 # The empty tree's SHA is a git constant (content-addressed hash of zero
