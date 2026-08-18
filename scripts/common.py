@@ -109,6 +109,31 @@ def _request(method, path, token, **kwargs):
         return resp
     if last_exc is not None:
         raise last_exc
+    if resp.status_code == 403:
+        # Every attempt came back 403 and none of them was recognized above
+        # as a genuine secondary rate limit (message mentions 'rate limit')
+        # — most likely because this 403's body wasn't the JSON shape
+        # _permission_denied_message expects, not because it's actually a
+        # rate limit that just hasn't cleared yet. A *real* secondary rate
+        # limit should clear well within _MAX_RETRIES attempts of backoff
+        # (up to _BACKOFF_CAP_S each); one that doesn't is behaving exactly
+        # like a permission problem, so treat it as one here too rather
+        # than falling through to a bare resp.raise_for_status() below.
+        # That would surface as an opaque "403 Client Error: Forbidden",
+        # which callers' `except requests.RequestException` (meant for
+        # transient 5xx/network trouble — see cmd_next et al.) would
+        # silently swallow, masking a persistent problem as a passing
+        # blip instead of raising TokenPermissionError like the immediate
+        # case above does.
+        message = _permission_denied_message(resp) or resp.text[:200]
+        raise TokenPermissionError(
+            f"GitHub kept returning 403 Forbidden for {method} {path} after "
+            f"{_MAX_RETRIES} attempts: {message!r}. This didn't look like a "
+            "rate limit, and a real one should have cleared by now: the "
+            "calling workflow must grant `permissions: contents: write` "
+            "(see docs/ARCHITECTURE.md 'State lives in the caller's repo, "
+            "not this one')."
+        )
     return resp  # last response, whatever it was, after exhausting retries
 
 
