@@ -3,13 +3,14 @@
 Everything here talks to the *calling* repository's own GitHub API (repo +
 token are always passed in explicitly, read from GITHUB_REPOSITORY /
 GITHUB_TOKEN by each script's CLI) — never a third-party service. See
-docs/ARCHITECTURE.md "Locking" and "Timing history" for why refs are used
-for claims (atomic create-if-absent) and the Contents API for
-state/timings.json (low-frequency, idempotent to retry).
+docs/ARCHITECTURE.md "Locking" and "Timing history" for why claims and
+timing history both go through the Contents API's read-modify-write (with
+retry-on-conflict) rather than one API call per region — request volume,
+not per-write atomicity, is what a full worker fan-out actually blows a
+budget on.
 """
 
 import base64
-import concurrent.futures
 import json
 import random
 import threading
@@ -24,8 +25,8 @@ _API_VERSION = "2022-11-28"
 
 # GitHub's secondary rate limits ask for backoff, not an immediate retry; a
 # full worker fleet (worker_count workers, no topup round to spread the load
-# across anymore — see _pipeline.yml) hammering the same repo's git/refs API
-# at once can plausibly hit this, worst-case near the tail of a run when most
+# across anymore — see _pipeline.yml) hammering the same repo's API at once
+# can plausibly hit this, worst-case near the tail of a run when most
 # regions are already done and most workers are simultaneously racing over
 # the few still left. Doubling from a 4s base (this is the GitHub API being
 # asked to recover, not this runner, same "give the other side room"
@@ -34,19 +35,16 @@ _MAX_RETRIES = 8
 _BACKOFF_BASE_S = 4
 _BACKOFF_CAP_S = 60
 
-# _request is called from many threads at once (delete_refs' pool). A 403/429
-# hit by one thread almost always means every other thread in the same burst
-# is about to hit it too — GitHub's secondary rate limit wants a genuine
-# quiet period before it lifts, not just each caller's own request rate cut
-# in half. Per-thread "full jitter" backoff (sleep a random amount in
-# [0, backoff)) doesn't provide that: across N independently-jittering
-# threads it's near-certain that *someone's* next request lands within any
-# given fraction of a second, so the aggregate request rate never actually
-# drops to zero and the limit never clears — every thread just burns its own
-# retry budget in lockstep and still 403s at the end. A shared cooldown gate
-# fixes this: the first thread to see the signal makes *every* thread
-# (including ones about to start a fresh request) wait out the same window
-# together, so the API actually gets the quiet period it's asking for.
+# Every current caller of _request is single-threaded (no more thread pool
+# hammering this concurrently within one process — the claims locking that
+# used to need one, refs' bulk delete, is gone; see docs/ARCHITECTURE.md
+# "Locking"), so this gate's cross-thread coordination is dormant today, not
+# load-bearing. Kept rather than removed: it's a no-op overhead-wise for a
+# single thread (one lock check, no contention), and if `_request` ever
+# gains another concurrent caller, this is exactly the mechanism that keeps
+# a 403/429 hit by one thread from leaving every other thread to burn its
+# own retry budget in lockstep and still 403 at the end — see the shared
+# vs. per-thread backoff reasoning this was originally built for.
 _rate_limit_lock = threading.Lock()
 _rate_limit_until = 0.0
 
@@ -148,17 +146,21 @@ def _request(method, path, token, **kwargs):
         # above (message didn't parse as JSON, or wasn't conclusive), but
         # also never actually cleared like a genuine secondary rate limit
         # should within _MAX_RETRIES attempts of backoff (up to
-        # _BACKOFF_CAP_S each). Two real causes look identical from here —
-        # the calling workflow lacking `permissions: contents: write`, or a
-        # secondary rate limit/abuse-detection window that outlasted this
-        # call's own retry budget (more likely under heavy concurrent
-        # mutation volume, e.g. delete_refs' bulk cleanup) — so the message
-        # below says so rather than guessing. Either way this needs to
-        # surface loudly: falling through to a bare resp.raise_for_status()
-        # would produce an opaque "403 Client Error: Forbidden" that
-        # callers' `except requests.RequestException` (meant for transient
-        # 5xx/network trouble — see cmd_next et al.) would silently
-        # swallow, masking either cause as a passing blip.
+        # _BACKOFF_CAP_S each, ~5 minutes total). Three real causes look
+        # identical from here — the calling workflow lacking `permissions:
+        # contents: write`; a secondary rate limit/abuse-detection window
+        # that outlasted this call's retry budget; or the token's *primary*
+        # hourly quota being exhausted outright ("API rate limit exceeded
+        # for installation" — this one won't clear for up to an hour, so no
+        # retry budget short of that will ever succeed; batching claims
+        # (see docs/ARCHITECTURE.md "Locking") is what keeps total request
+        # volume from getting anywhere near that quota in the first place)
+        # — so the message below says so rather than guessing. Either way
+        # this needs to surface loudly: falling through to a bare
+        # resp.raise_for_status() would produce an opaque "403 Client Error:
+        # Forbidden" that callers' `except requests.RequestException` (meant
+        # for transient 5xx/network trouble — see cmd_next et al.) would
+        # silently swallow, masking any of the three as a passing blip.
         message = _permission_denied_message(resp) or resp.text[:200]
         raise TokenPermissionError(
             f"GitHub kept returning 403 Forbidden for {method} {path} after "
@@ -166,7 +168,9 @@ def _request(method, path, token, **kwargs):
             "workflow is missing `permissions: contents: write` (see "
             "docs/ARCHITECTURE.md 'State lives in the caller's repo, not "
             "this one'), or this is a secondary rate limit/abuse-detection "
-            "window that outlasted this call's retry budget — check "
+            "window, or the primary hourly quota ('API rate limit exceeded "
+            "for installation' — doesn't clear for up to an hour, so retrying "
+            "now won't help), that outlasted this call's retry budget — check "
             "whether other calls in the same run succeeded before assuming "
             "the former."
         )
@@ -211,63 +215,6 @@ def create_ref(repo, token, ref, sha):
         return False
     resp.raise_for_status()
     return False
-
-
-def delete_ref(repo, token, ref):
-    """ref: without the leading 'refs/'. No-op if already gone."""
-    resp = _request("DELETE", f"/repos/{repo}/git/refs/{ref}", token)
-    if resp.status_code not in (204, 404, 422):
-        resp.raise_for_status()
-
-
-def list_matching_refs(repo, token, prefix):
-    """prefix: without the leading 'refs/', e.g. 'claims'. Returns one
-    {"ref": "refs/..."} dict per ref starting with 'refs/<prefix>/'."""
-    quoted = urllib.parse.quote(prefix, safe="/")
-    resp = _request("GET", f"/repos/{repo}/git/matching-refs/{quoted}", token)
-    if resp.status_code == 404:
-        return []
-    resp.raise_for_status()
-    return [{"ref": entry["ref"]} for entry in resp.json()]
-
-
-# GitHub's GraphQL API can only resolve global IDs for refs under refs/heads
-# and refs/tags — a custom namespace like refs/claims/... deletes fine over
-# REST but its deleteRef mutation rejects the same ref's node_id 100% of the
-# time with "Could not resolve to a node with the global id"
-# (https://github.com/orgs/community/discussions/83980). So this uses REST's
-# one-ref-per-call DELETE (delete_ref), parallelized over a thread pool since
-# there's no bulk-delete endpoint to fall back on — same approach as
-# fetch_pbf_sizes in leaves.py. Kept low (not e.g. 16, the fetch_pbf_sizes
-# figure) because that many concurrent *mutating* requests against the same
-# endpoint is well past GitHub's own secondary-rate-limit guidance of ~1
-# mutating request/sec — a run with hundreds of regions (hundreds of prior
-# claim/done/failed ref writes already made before cleanup even starts)
-# hitting cleanup with 16-way concurrent DELETEs was observed 403ing ~40% of
-# them, recovering on a later run's cleanup sweep only because that sweep
-# hit the same wall on a smaller remaining set. fetch_pbf_sizes' 16 is fine
-# because GETs aren't subject to the same secondary limit.
-_DELETE_REFS_MAX_WORKERS = 4
-
-
-def delete_refs(repo, token, refs):
-    """refs: the list of {"ref"} dicts from list_matching_refs. Best effort,
-    same contract as delete_ref: returns a list of (ref_name, error_message)
-    for every ref that failed to delete, for the caller to log and leave for
-    a later cleanup run rather than aborting the rest of this one over it."""
-    failed = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=_DELETE_REFS_MAX_WORKERS) as pool:
-        future_to_entry = {
-            pool.submit(delete_ref, repo, token, entry["ref"][len("refs/"):]): entry
-            for entry in refs
-        }
-        for future in concurrent.futures.as_completed(future_to_entry):
-            entry = future_to_entry[future]
-            try:
-                future.result()
-            except Exception as exc:
-                failed.append((entry["ref"], str(exc)))
-    return failed
 
 
 # The empty tree's SHA is a git constant (content-addressed hash of zero

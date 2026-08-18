@@ -43,10 +43,17 @@ runs:
         OUTPUT_BASENAME: ${{ inputs.output_basename }}
       run: |
         set -euo pipefail
+        # claim-batch.json (see --batch-cache) is this worker's local cache
+        # of a shared-claims-file batch grab — plain literal filename shared
+        # with the loop step below the same way first-claim.json already is,
+        # since bash variables don't cross composite-action steps. Starting
+        # it here (rather than lazily on the loop's first iteration) means
+        # this first claim and every later one in the loop go through the
+        # exact same cache-then-refill path.
         CLAIM_JSON=$(python .tiledistillery/scripts/claim.py next \
           --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
           --state-branch state --output-basename "$OUTPUT_BASENAME" \
-          --manifest queue-manifest.json)
+          --manifest queue-manifest.json --batch-cache claim-batch.json)
         echo "$CLAIM_JSON" > first-claim.json
         echo "claimed=$(jq -r '.claimed' <<<"$CLAIM_JSON")" >> "$GITHUB_OUTPUT"
 
@@ -78,16 +85,17 @@ runs:
         IFS=',' read -ra PROCESSES <<< "$PROCESS"
         IFS=',' read -ra BASENAMES <<< "$OUTPUT_BASENAME"
 
-        # `claim.py done` only appends this worker's durations here, locally
-        # (see its docstring for why writing the shared timing-history file
-        # once per region — rather than once per worker — turns it into a
-        # hot lock under a full worker fan-out). This action does not write
-        # that shared file itself at all: the calling job uploads this path
+        # `claim.py done`/`failed` only append this worker's outcomes here,
+        # locally (see cmd_done's docstring for why writing the shared claims
+        # file once per region — rather than once per worker — turns it into
+        # a hot lock under a full worker fan-out). This action does not write
+        # any shared file itself at all: the calling job uploads this path
         # as an artifact (same pattern as the shards dir), and a single
         # dedicated job downloads every worker's buffer and merges them into
-        # the shared file in exactly one write — see `record-timings` in
-        # _pipeline.yml and cmd_flush_timings in scripts/claim.py. That's a
-        # single writer for the whole run, not just a less-contended one.
+        # the shared timing-history and claims files in one write each — see
+        # `record-timings` in _pipeline.yml and cmd_flush_timings in
+        # scripts/claim.py. That's a single writer for the whole run, not
+        # just a less-contended one.
         TIMINGS_BUFFER=timings-buffer.jsonl
 
         # Seeded from the first-claim step above, so this loop doesn't spend
@@ -186,11 +194,12 @@ runs:
               --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
               --state-branch state --output-basename "$OUTPUT_BASENAME" \
               --region-id "$REGION_ID" \
-              --error "build failed (exit ${STATUS})"
+              --error "build failed (exit ${STATUS})" \
+              --timings-buffer "$TIMINGS_BUFFER"
           fi
 
           CLAIM_JSON=$(python .tiledistillery/scripts/claim.py next \
             --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
             --state-branch state --output-basename "$OUTPUT_BASENAME" \
-            --manifest queue-manifest.json)
+            --manifest queue-manifest.json --batch-cache claim-batch.json)
         done

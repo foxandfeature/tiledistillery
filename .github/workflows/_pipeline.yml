@@ -8,13 +8,14 @@ name: TileDistillery pipeline (reusable)
 # region across every config in the list, same fetch/build split
 # TileAlchemist uses for its own multi-profile runs.
 #
-# prepare -> build (single claim-loop matrix) -> verify-complete (hard
-# gate) -> cleanup (always), with record-timings (always, single writer for
-# the run's whole timing history) and merge (matrixed per output_basename)
-# both branching off in parallel afterward — merge off verify-complete,
-# record-timings off build directly. cleanup only waits on verify-complete
-# (the last job that still reads the claim refs), not on merge or
-# record-timings, since neither of those touches claim refs.
+# prepare -> build (single claim-loop matrix) -> record-timings (always,
+# single writer that both records the run's timing history and, since
+# every worker's done/failed outcome is only buffered locally until this
+# runs — see cmd_flush_timings in scripts/claim.py — releases every claimed
+# region's lock) -> verify-complete (hard gate) -> cleanup (always), with
+# merge (matrixed per output_basename) branching off verify-complete in
+# parallel. cleanup only waits on verify-complete (the last job that still
+# reads claim state), not on merge, since merge never touches it.
 # One round, not two, kept simple on purpose (see docs/ARCHITECTURE.md
 # "Distribution"): a worker crashing mid-region or hitting its own time
 # wall costs that one region, not a second dispatch — every other worker in
@@ -180,18 +181,22 @@ jobs:
           path: timings-buffer.jsonl
           if-no-files-found: ignore
 
-  # Centralizes timing-history recording into a single writer for the whole
-  # run, instead of every worker (or even every worker once) writing the
-  # shared state/timings/<output_basename>.json itself — see
-  # docs/ARCHITECTURE.md "Timing history & queue ordering" and cmd_done /
-  # cmd_flush_timings in scripts/claim.py for why per-writer contention on
-  # that file was a real problem, not just a theoretical one. Independent
-  # of verify-complete: timing history only feeds *future* runs' queue
-  # ordering, never this run's correctness, so it shouldn't gate merge/
-  # publish, and runs unconditionally so a run that ultimately fails
-  # verify-complete still keeps whatever timing data it produced. `if:
-  # always()` also means one failed `build` matrix leg doesn't cost every
-  # other, healthy leg's timing data.
+  # Centralizes timing-history *and* claim-outcome recording into a single
+  # writer for the whole run, instead of every worker (or even every worker
+  # once) writing the shared state/timings/<output_basename>.json or
+  # state/claims/<scope>.json itself — see docs/ARCHITECTURE.md "Timing
+  # history & queue ordering" and cmd_done/cmd_flush_timings in
+  # scripts/claim.py for why per-writer contention on those files was a
+  # real problem, not just a theoretical one. The timing-history half is
+  # still independent of verify-complete (it only feeds *future* runs'
+  # queue ordering, never this run's correctness) and runs unconditionally
+  # so a run that ultimately fails verify-complete still keeps whatever
+  # timing data it produced — but the claims half is what actually applies
+  # every worker's buffered done/failed outcomes to the shared file (see
+  # cmd_flush_timings's docstring), so verify-complete now waits on this
+  # job too, not just on `build`. `if: always()` also means one failed
+  # `build` matrix leg doesn't cost every other, healthy leg's timing data
+  # or claim outcomes.
   record-timings:
     needs: build
     if: always()
@@ -240,10 +245,14 @@ jobs:
   # world layer with holes in it (see docs/ARCHITECTURE.md "Merge"). `if:
   # always()` so this still runs (and correctly reports/fails) even when one
   # or more `build` matrix legs failed at the job level — every worker that
-  # did finish has already recorded its claims on the state branch
-  # regardless of a sibling leg's own outcome.
+  # did finish has already buffered its claims locally regardless of a
+  # sibling leg's own outcome. Needs `record-timings` too, not just `build`:
+  # that's the job that actually applies those buffered outcomes to the
+  # shared claims file (see its comment above) — without waiting on it,
+  # every region would still read back as `remaining` here even on a
+  # perfectly healthy run.
   verify-complete:
-    needs: build
+    needs: [build, record-timings]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -362,13 +371,15 @@ jobs:
           name: ${{ matrix.basename }}-pmtiles
           path: ${{ matrix.basename }}.pmtiles
 
-  # Only actually needs verify-complete: that's the last job that reads the
-  # claim refs (finalize_check.py's completeness check), so it's the only
-  # thing cleanup must wait behind. merge and record-timings never touch
-  # claim refs at all (shards/timings artifacts only), so gating cleanup on
-  # them too just delayed it for no reason — it now runs as soon as
-  # verify-complete finishes, in parallel with merge/record-timings instead
-  # of after them.
+  # Only actually needs verify-complete: that's the last job that reads
+  # claim state (finalize_check.py's completeness check), so it's the only
+  # thing cleanup must wait behind — and verify-complete itself already
+  # waits on record-timings (the job that writes claim state), so this
+  # transitively runs after that write too without needing to depend on it
+  # directly. merge never touches claim state at all (shards artifacts
+  # only), so gating cleanup on it too would just delay it for no reason —
+  # it runs as soon as verify-complete finishes, in parallel with merge
+  # instead of after it.
   cleanup:
     needs: verify-complete
     if: always()
@@ -389,10 +400,10 @@ jobs:
 
       - run: pip install -r .tiledistillery/scripts/requirements.txt
 
-      - name: Delete every claim ref from this run
+      - name: Reset claim state for this run
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python .tiledistillery/scripts/cleanup_claims.py \
             --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
-            --output-basename "${{ inputs.output_basename }}"
+            --state-branch state --output-basename "${{ inputs.output_basename }}"
