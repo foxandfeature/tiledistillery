@@ -1,5 +1,7 @@
 {
-  "lock": [
+  "done": [
     "europe/monaco"
-  ]
+  ],
+  "failed": [],
+  "lock": []
 }
