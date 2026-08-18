@@ -296,10 +296,16 @@ jobs:
           path: shards
           merge-multiple: true
 
+      # apt-get update has no built-in bound on a stalled mirror connection
+      # (seen hanging 20+ minutes against GitHub's default Azure mirror), so
+      # give it explicit per-request timeouts/retries and a step-level
+      # backstop — either lets it fail fast into the source-build fallback
+      # below instead of eating the whole job's runtime.
       - name: Install tippecanoe
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y tippecanoe || {
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 update \
+            && sudo apt-get install -y tippecanoe || {
             git clone --depth 1 https://github.com/felt/tippecanoe.git /tmp/tippecanoe
             make -C /tmp/tippecanoe -j"$(nproc)"
             sudo make -C /tmp/tippecanoe install
