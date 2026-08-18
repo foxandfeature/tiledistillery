@@ -143,29 +143,32 @@ def _request(method, path, token, **kwargs):
     if last_exc is not None:
         raise last_exc
     if resp.status_code == 403:
-        # Every attempt came back 403 and none of them was recognized above
-        # as a genuine secondary rate limit (message mentions 'rate limit')
-        # — most likely because this 403's body wasn't the JSON shape
-        # _permission_denied_message expects, not because it's actually a
-        # rate limit that just hasn't cleared yet. A *real* secondary rate
-        # limit should clear well within _MAX_RETRIES attempts of backoff
-        # (up to _BACKOFF_CAP_S each); one that doesn't is behaving exactly
-        # like a permission problem, so treat it as one here too rather
-        # than falling through to a bare resp.raise_for_status() below.
-        # That would surface as an opaque "403 Client Error: Forbidden",
-        # which callers' `except requests.RequestException` (meant for
-        # transient 5xx/network trouble — see cmd_next et al.) would
-        # silently swallow, masking a persistent problem as a passing
-        # blip instead of raising TokenPermissionError like the immediate
-        # case above does.
+        # Every attempt came back 403 and never resolved into a definite
+        # verdict either way: not immediately recognized as permission-denied
+        # above (message didn't parse as JSON, or wasn't conclusive), but
+        # also never actually cleared like a genuine secondary rate limit
+        # should within _MAX_RETRIES attempts of backoff (up to
+        # _BACKOFF_CAP_S each). Two real causes look identical from here —
+        # the calling workflow lacking `permissions: contents: write`, or a
+        # secondary rate limit/abuse-detection window that outlasted this
+        # call's own retry budget (more likely under heavy concurrent
+        # mutation volume, e.g. delete_refs' bulk cleanup) — so the message
+        # below says so rather than guessing. Either way this needs to
+        # surface loudly: falling through to a bare resp.raise_for_status()
+        # would produce an opaque "403 Client Error: Forbidden" that
+        # callers' `except requests.RequestException` (meant for transient
+        # 5xx/network trouble — see cmd_next et al.) would silently
+        # swallow, masking either cause as a passing blip.
         message = _permission_denied_message(resp) or resp.text[:200]
         raise TokenPermissionError(
             f"GitHub kept returning 403 Forbidden for {method} {path} after "
-            f"{_MAX_RETRIES} attempts: {message!r}. This didn't look like a "
-            "rate limit, and a real one should have cleared by now: the "
-            "calling workflow must grant `permissions: contents: write` "
-            "(see docs/ARCHITECTURE.md 'State lives in the caller's repo, "
-            "not this one')."
+            f"{_MAX_RETRIES} attempts: {message!r}. Either the calling "
+            "workflow is missing `permissions: contents: write` (see "
+            "docs/ARCHITECTURE.md 'State lives in the caller's repo, not "
+            "this one'), or this is a secondary rate limit/abuse-detection "
+            "window that outlasted this call's retry budget — check "
+            "whether other calls in the same run succeeded before assuming "
+            "the former."
         )
     return resp  # last response, whatever it was, after exhausting retries
 
@@ -235,8 +238,16 @@ def list_matching_refs(repo, token, prefix):
 # (https://github.com/orgs/community/discussions/83980). So this uses REST's
 # one-ref-per-call DELETE (delete_ref), parallelized over a thread pool since
 # there's no bulk-delete endpoint to fall back on — same approach as
-# fetch_pbf_sizes in leaves.py.
-_DELETE_REFS_MAX_WORKERS = 16
+# fetch_pbf_sizes in leaves.py. Kept low (not e.g. 16, the fetch_pbf_sizes
+# figure) because that many concurrent *mutating* requests against the same
+# endpoint is well past GitHub's own secondary-rate-limit guidance of ~1
+# mutating request/sec — a run with hundreds of regions (hundreds of prior
+# claim/done/failed ref writes already made before cleanup even starts)
+# hitting cleanup with 16-way concurrent DELETEs was observed 403ing ~40% of
+# them, recovering on a later run's cleanup sweep only because that sweep
+# hit the same wall on a smaller remaining set. fetch_pbf_sizes' 16 is fine
+# because GETs aren't subject to the same secondary limit.
+_DELETE_REFS_MAX_WORKERS = 4
 
 
 def delete_refs(repo, token, refs):
