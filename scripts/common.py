@@ -10,6 +10,7 @@ state/timings.json (low-frequency, idempotent to retry).
 
 import base64
 import json
+import random
 import time
 import urllib.parse
 
@@ -19,14 +20,24 @@ API_BASE = "https://api.github.com"
 _HEADERS_ACCEPT = "application/vnd.github+json"
 _API_VERSION = "2022-11-28"
 
-# GitHub's secondary rate limits ask for backoff, not an immediate retry;
-# a handful of workers hammering the same repo's API can plausibly hit this.
-# Doubling from 4s (4, 8, 16, 32, 64, 128) rather than an immediate/short
-# retry: this is the GitHub API itself, not this runner, being asked to
-# recover, so the same "give the other side room" reasoning as the curl
-# download retry applies, just against a different server.
-_MAX_RETRIES = 6
+# GitHub's secondary rate limits ask for backoff, not an immediate retry; a
+# full worker fleet (worker_count workers, no topup round to spread the load
+# across anymore — see _pipeline.yml) hammering the same repo's git/refs API
+# at once can plausibly hit this, worst-case near the tail of a run when most
+# regions are already done and most workers are simultaneously racing over
+# the few still left. Doubling from a 4s base (this is the GitHub API being
+# asked to recover, not this runner, same "give the other side room"
+# reasoning as the curl download retry) up to _BACKOFF_CAP_S; "full jitter"
+# (sleep a random amount in [0, backoff), not the backoff itself) keeps
+# retrying workers from re-colliding in lockstep on the next attempt, which
+# a fixed exponential delay would not.
+_MAX_RETRIES = 8
 _BACKOFF_BASE_S = 4
+_BACKOFF_CAP_S = 60
+
+
+def _backoff_sleep(attempt):
+    time.sleep(random.uniform(0, min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2 ** attempt))))
 
 
 def _headers(token):
@@ -67,7 +78,7 @@ def _request(method, path, token, **kwargs):
             resp = requests.request(method, url, headers=_headers(token), timeout=30, **kwargs)
         except requests.RequestException as exc:
             last_exc = exc
-            time.sleep(_BACKOFF_BASE_S * (2 ** attempt))
+            _backoff_sleep(attempt)
             continue
         if resp.status_code == 403:
             message = _permission_denied_message(resp)
@@ -80,7 +91,19 @@ def _request(method, path, token, **kwargs):
                     "'State lives in the caller's repo, not this one')."
                 )
         if resp.status_code in (403, 429) or resp.status_code >= 500:
-            time.sleep(_BACKOFF_BASE_S * (2 ** attempt))
+            # GitHub's secondary-rate-limit responses often carry a
+            # Retry-After (seconds) that's a more authoritative wait time
+            # than a blind guess — honor it, still jittered a little so a
+            # whole fleet released on the same limit doesn't retry in the
+            # exact same instant, but otherwise fall back to backoff.
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after is not None:
+                try:
+                    time.sleep(float(retry_after) + random.uniform(0, 1))
+                except ValueError:
+                    _backoff_sleep(attempt)
+            else:
+                _backoff_sleep(attempt)
             continue
         return resp
     if last_exc is not None:
