@@ -1,16 +1,11 @@
 name: 'Claim and build Geofabrik regions'
 description: >
-  Pulls the tilemaker image and this pipeline's own scripts, then loops
-  claiming leaf regions from the shared queue (see docs/ARCHITECTURE.md
-  "Distribution" and "Locking") and building each with tilemaker, until the
-  queue is exhausted or this job runs low on time. Assumes the caller repo
-  is already checked out at the workspace root and this pipeline's own repo
-  under `.tiledistillery/`. config/process/output_basename take one value
-  each, or comma-separated lists matched 1:1 — building more than one layer
-  this way claims a region once and downloads its .osm.pbf once, running
-  tilemaker once per config against those same bytes (see
-  docs/ARCHITECTURE.md "Distribution", the same optimization TileAlchemist
-  applies to its own multi-profile runs).
+  Claims leaf regions from the shared queue and builds each with tilemaker,
+  until the queue is exhausted or the job runs low on time. Assumes the
+  caller repo is already checked out at the workspace root and this
+  pipeline's own repo under `.tiledistillery/`. See docs/ARCHITECTURE.md
+  "Distribution", "Locking", and "Multiple layers, one download" for
+  details.
 inputs:
   config:
     description: 'Path(s), in the caller repo, to tilemaker JSON layer config(s): one value, or a comma-separated list matched 1:1 with process/output_basename.'
@@ -21,17 +16,6 @@ inputs:
   output_basename:
     description: 'Base name(s) for the output .pmtiles file(s), matched 1:1 with config/process. Also the claim/timing-history scope key, taken verbatim — see docs/ARCHITECTURE.md "Locking".'
     required: true
-  manifest:
-    description: Path to the queue-manifest.json produced by the prepare job.
-    required: false
-    default: queue-manifest.json
-  shards_dir:
-    required: false
-    default: shards
-  timings_buffer:
-    description: 'Local file this worker''s per-region durations are appended to (see cmd_done in scripts/claim.py). The calling job uploads it as an artifact; nothing in this action writes it to the shared state branch.'
-    required: false
-    default: timings-buffer.jsonl
 
 runs:
   using: composite
@@ -45,13 +29,12 @@ runs:
       run: pip install -r .tiledistillery/scripts/requirements.txt
 
     # Claims this worker's first region *before* pulling the (large)
-    # tilemaker image, not after: with worker_count fanned out well past
-    # how many regions are actually left near the end of a run (see
-    # docs/ARCHITECTURE.md "Distribution"), a worker that starts to find the
-    # queue already fully claimed by its siblings has no use for the image
-    # at all. Paying for setup-python/pip install first is unavoidable —
-    # claim.py itself needs `requests` just to make this one check — but
-    # that's a small, fast install next to a multi-hundred-MB docker pull.
+    # tilemaker image, not after — a worker whose queue is already fully
+    # claimed by siblings has no use for the image (see docs/ARCHITECTURE.md
+    # "Distribution"). Paying for setup-python/pip install first is
+    # unavoidable — claim.py itself needs `requests` just to make this one
+    # check — but that's a small, fast install next to a multi-hundred-MB
+    # docker pull.
     - name: Claim this worker's first region
       id: first-claim
       shell: bash
@@ -63,27 +46,20 @@ runs:
         CLAIM_JSON=$(python .tiledistillery/scripts/claim.py next \
           --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
           --state-branch state --output-basename "$OUTPUT_BASENAME" \
-          --manifest "${{ inputs.manifest }}")
+          --manifest queue-manifest.json)
         echo "$CLAIM_JSON" > first-claim.json
         echo "claimed=$(jq -r '.claimed' <<<"$CLAIM_JSON")" >> "$GITHUB_OUTPUT"
 
     - name: Pull tilemaker image
       if: steps.first-claim.outputs.claimed == 'true'
       shell: bash
-      # ghcr.io/systemed/tilemaker is the project's own published image —
-      # current tilemaker, not whatever's frozen in Ubuntu's universe repo
-      # (Noble ships 2.4.0, pre-3.0's Lua API and missing since-fixed
-      # crashes; see the incident that prompted this switch). ":master" is
-      # the only tag the upstream publish workflow produces (no semver
-      # tags — see its docker-publish job), so this floats with upstream's
-      # own default branch rather than pinning to an immutable release;
-      # accepted since upstream's master is actively maintained and this
-      # replaces a pin to an *unmaintained* apt snapshot, not a maintained
-      # one. Pulled once per worker job, reused for every region it claims
-      # in its loop below (same "already warm" reasoning docs/ARCHITECTURE.md
-      # gives for the tilemaker binary itself), and skipped entirely above
-      # when this worker's very first claim attempt already found nothing
-      # left to build.
+      # ghcr.io/systemed/tilemaker is the project's own published image — current
+      # tilemaker, not whatever's frozen in Ubuntu's universe repo (Noble ships
+      # 2.4.0, pre-3.0's Lua API and missing since-fixed crashes). ":master" is
+      # the only tag upstream's publish workflow produces (no semver tags), so
+      # this floats with upstream's default branch rather than pinning to an
+      # immutable release — accepted since master is actively maintained,
+      # unlike the unmaintained apt snapshot this replaces.
       run: docker pull ghcr.io/systemed/tilemaker:master
 
     - name: Claim and build regions until the queue is empty
@@ -96,7 +72,7 @@ runs:
         OUTPUT_BASENAME: ${{ inputs.output_basename }}
       run: |
         set -euo pipefail
-        mkdir -p "${{ inputs.shards_dir }}"
+        mkdir -p shards
 
         IFS=',' read -ra CONFIGS <<< "$CONFIG"
         IFS=',' read -ra PROCESSES <<< "$PROCESS"
@@ -107,12 +83,12 @@ runs:
         # once per region — rather than once per worker — turns it into a
         # hot lock under a full worker fan-out). This action does not write
         # that shared file itself at all: the calling job uploads this path
-        # as an artifact (same pattern as shards_dir), and a single
+        # as an artifact (same pattern as the shards dir), and a single
         # dedicated job downloads every worker's buffer and merges them into
         # the shared file in exactly one write — see `record-timings` in
         # _pipeline.yml and cmd_flush_timings in scripts/claim.py. That's a
         # single writer for the whole run, not just a less-contended one.
-        TIMINGS_BUFFER="${{ inputs.timings_buffer }}"
+        TIMINGS_BUFFER=timings-buffer.jsonl
 
         # Seeded from the first-claim step above, so this loop doesn't spend
         # a second claim attempt re-discovering what that step already
@@ -174,7 +150,7 @@ runs:
                 -v "$GITHUB_WORKSPACE:/data" -w /data \
                 ghcr.io/systemed/tilemaker:master \
                 --input region.osm.pbf \
-                --output "${{ inputs.shards_dir }}/${SAFE_NAME}--${BASENAMES[$i]}.mbtiles" \
+                --output "shards/${SAFE_NAME}--${BASENAMES[$i]}.mbtiles" \
                 --config "${CONFIGS[$i]}" --process "${PROCESSES[$i]}" \
                 --store "$STORE_DIR"
               STATUS=$?
@@ -205,7 +181,7 @@ runs:
             # Any shard already written by a config that succeeded before a
             # later one failed must not survive into the shards artifact,
             # since this region is about to be marked failed, not done.
-            rm -f "${{ inputs.shards_dir }}/${SAFE_NAME}--"*.mbtiles
+            rm -f "shards/${SAFE_NAME}--"*.mbtiles
             python .tiledistillery/scripts/claim.py failed \
               --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
               --state-branch state --output-basename "$OUTPUT_BASENAME" \
@@ -216,5 +192,5 @@ runs:
           CLAIM_JSON=$(python .tiledistillery/scripts/claim.py next \
             --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
             --state-branch state --output-basename "$OUTPUT_BASENAME" \
-            --manifest "${{ inputs.manifest }}")
+            --manifest queue-manifest.json)
         done
