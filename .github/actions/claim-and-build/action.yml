@@ -1,16 +1,11 @@
 name: 'Claim and build Geofabrik regions'
 description: >
-  Pulls the tilemaker image and this pipeline's own scripts, then loops
-  claiming leaf regions from the shared queue (see docs/ARCHITECTURE.md
-  "Distribution" and "Locking") and building each with tilemaker, until the
-  queue is exhausted or this job runs low on time. Assumes the caller repo
-  is already checked out at the workspace root and this pipeline's own repo
-  under `.tiledistillery/`. config/process/output_basename take one value
-  each, or comma-separated lists matched 1:1 — building more than one layer
-  this way claims a region once and downloads its .osm.pbf once, running
-  tilemaker once per config against those same bytes (see
-  docs/ARCHITECTURE.md "Distribution", the same optimization TileAlchemist
-  applies to its own multi-profile runs).
+  Claims leaf regions from the shared queue and builds each with tilemaker,
+  until the queue is exhausted or the job runs low on time. Assumes the
+  caller repo is already checked out at the workspace root and this
+  pipeline's own repo under `.tiledistillery/`. See docs/ARCHITECTURE.md
+  "Distribution", "Locking", and "Multiple layers, one download" for
+  details.
 inputs:
   config:
     description: 'Path(s), in the caller repo, to tilemaker JSON layer config(s): one value, or a comma-separated list matched 1:1 with process/output_basename.'
