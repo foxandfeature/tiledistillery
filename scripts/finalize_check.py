@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Compares the run's manifest against current claim-ref state on the
+"""Compares the run's manifest against the current claims-file state on the
 calling repository's own `state` branch. Prints one JSON object
 `{"done": [...], "failed": [...], "remaining": [...]}` (region ids) to
 stdout. `remaining` is what's neither done nor permanently failed — a
 non-empty `remaining` once the claim-loop round is finished means the run
 is incomplete (see docs/ARCHITECTURE.md "Merge"): either the queue never
-got claimed in time, or a worker crashed mid-build and left its region's
-lock stuck (see docs/ARCHITECTURE.md "Locking").
+got claimed in time, a worker crashed mid-build and left its claimed
+batch's lock entries stuck (see docs/ARCHITECTURE.md "Locking"), or a
+worker finished its regions but its outcome buffer never made it into
+`flush-timings` (see cmd_flush_timings in claim.py). This is why
+`verify-complete` (the job that runs this) waits on `record-timings` (the
+job that runs `flush-timings`), not just on `build`.
 
 With --fail-if-incomplete, exits non-zero (after printing the JSON) when
 `remaining` is non-empty, for use as the very last check before merging.
@@ -33,7 +37,7 @@ def main():
         manifest = json.load(f)
 
     scope = claim.scope_prefix(args.output_basename)
-    state = claim.load_state(args.repo, args.token, scope)
+    state = claim.load_state(args.repo, args.token, args.state_branch, scope)
 
     done, failed, remaining = [], [], []
     for region in manifest["regions"]:

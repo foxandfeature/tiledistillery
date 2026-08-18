@@ -1,13 +1,30 @@
 #!/usr/bin/env python3
-"""Claim lifecycle over the git-ref locking scheme, against the calling
-repository's own `state` branch. See docs/ARCHITECTURE.md "Locking": one
-region's claim state lives entirely in ref *names* under
-`refs/claims/<output_basename>/<region-id>/...`, so a single ref listing is
-enough to know what's claimed, done, or failed — no ref ever needs its
-pointed-to commit's content read back. `done`/`failed` re-derive which
-lock ref(s) to release themselves (one fresh listing each) rather than
-having the caller thread a ref path through the CLI, since region-id alone
-is always enough to reconstruct it.
+"""Claim lifecycle over a shared JSON claims file, against the calling
+repository's own `state` branch. See docs/ARCHITECTURE.md "Locking":
+`state/claims/<scope>.json` holds three region-key lists — `lock`, `done`,
+`failed` — read and written through `common.update_json_file_with_retry`,
+the same read-modify-write-with-retry-on-conflict primitive `timings.json`
+already used (this replaced an earlier one-git-ref-per-region design; see
+ARCHITECTURE.md for why that stopped being reliable).
+
+`next` claims a small *batch* of regions (`--batch-size`, default 5) in one
+read-modify-write instead of one API round-trip per region, caching the
+rest locally (`--batch-cache`) so a worker only touches the shared file
+once every `--batch-size` regions. This is the actual fix for the request
+volume that was exhausting the calling workflow's hourly GitHub API quota:
+a full-fan-out run over hundreds of regions was making thousands of calls
+(a fresh listing plus a ref create/delete per region, times every worker) —
+comfortably over budget regardless of how well-tuned the retry/backoff was,
+since a *primary* quota exhaustion (GitHub's "API rate limit exceeded for
+installation") doesn't clear for up to an hour, unlike the secondary/abuse
+limit short backoff is meant for.
+
+A locked region is never reclaimed within the same run — same accepted
+tradeoff the old ref design made (see docs/ARCHITECTURE.md "Locking"): a
+crashed worker strands up to `--batch-size` regions instead of just one,
+which is the one real cost of batching, kept small by keeping the batch
+size small. `cleanup_claims.py` wipes the whole scope's state at the end of
+every run regardless of how it went, so this can't accumulate across runs.
 
 Subcommands, each printing one JSON object to stdout:
 
@@ -31,12 +48,15 @@ transiently down — this runner is the only thing running it — so a nonzero
 exit is tilemaker's own verdict on this region's data, not a blip worth
 retrying.
 
-`done` buffers its duration locally (--timings-buffer) rather than writing
-the shared timing-history file itself. `flush-timings` is run once, by a
-single dedicated job, against every worker's uploaded buffer (see
-_pipeline.yml's `record-timings` job) — one writer, one write, for the
-whole run. See cmd_done's docstring for why per-worker/per-region writes
-from inside the claim loop are the thing being avoided.
+`done` and `failed` don't touch the shared claims file at all: both append
+an outcome line to `--timings-buffer` locally (same buffer file `done`
+always used for durations — it now carries a `status` per line, not just a
+duration). `flush-timings` is run once, by a single dedicated job, against
+every worker's uploaded buffer (see _pipeline.yml's `record-timings` job) —
+one writer, one write, for both the timing-history file and the shared
+claims file's `done`/`failed` lists. See cmd_done's docstring for why
+per-worker/per-region writes from inside the claim loop are the thing being
+avoided.
 """
 
 import argparse
@@ -54,146 +74,182 @@ def scope_prefix(output_basename):
     return common.sanitize_ref_component(output_basename)
 
 
-class ClaimState:
-    """Parsed view of every ref under one scope prefix.
+def claims_path(scope):
+    return f"state/claims/{scope}.json"
 
-    `.../lock` is a *fixed* name per region — the actual mutex, since two
-    workers racing for the same region only collide (one 422s) if they're
-    trying to create the exact same ref name. There is no companion
-    timestamp ref and no staleness sweep: a lock is only ever released by
-    the worker that holds it, via `done` or `failed`. A worker that never
-    gets there (crashed, OOM-killed, hit the job time limit) leaves its
-    region's `lock` stuck for the rest of this run — accepted for now to
-    keep the state machine to three ref kinds; `cleanup_claims.py` wipes
-    everything at the end of every run regardless of how it went, so this
-    can't accumulate across runs. `worker_count` (see
+
+class ClaimState:
+    """Parsed view of one scope's claims file (`{"lock": [...], "done":
+    [...], "failed": [...]}`, each a list of region keys).
+
+    `lock` is the actual mutex: a region key only ever enters it once, via
+    the compare-and-swap `_claim_batch` does inside
+    `update_json_file_with_retry`'s retry-on-conflict loop, so two workers
+    racing the same read-modify-write can't both add the same key (whichever
+    write lands second re-reads the first one's already-updated `lock` and
+    skips it). There is no lease/timestamp and no staleness sweep: a lock is
+    only ever released by `flush-timings` moving the key into `done`/`failed`
+    once the worker that claimed it reports back. A worker that never gets
+    there (crashed, OOM-killed, hit the job time limit) leaves its claimed
+    batch's remaining region(s) stuck for the rest of this run — the same
+    tradeoff the earlier one-ref-per-region design made, just with a blast
+    radius of `--batch-size` regions instead of one; `cleanup_claims.py`
+    wipes everything at the end of every run regardless of how it went, so
+    this can't accumulate across runs. `worker_count` (see
     docs/ARCHITECTURE.md "Distribution") is the mitigation: enough workers
-    fanned out into one round means one stuck lock costs one region, not
-    the run, and every other worker keeps draining the queue regardless.
+    fanned out into one round means one stuck batch costs a handful of
+    regions, not the run, and every other worker keeps draining the queue
+    regardless.
     """
 
-    def __init__(self, refs, prefix):
-        self.lock_present = set()  # region_id
-        self.done = set()
-        self.failed = set()
-        for entry in refs:
-            full_ref = entry["ref"]
-            if not full_ref.startswith(prefix):
-                continue
-            self._parse(full_ref[len(prefix):])
+    def __init__(self, content):
+        self.lock = set(content.get("lock", []))
+        self.done = set(content.get("done", []))
+        self.failed = set(content.get("failed", []))
 
-    def _parse(self, remainder):
-        # remainder is "<region/id/path>/lock" | ".../done" | ".../failed"
-        if remainder.endswith("/done"):
-            self.done.add(remainder[: -len("/done")])
-            return
-        if remainder.endswith("/failed"):
-            self.failed.add(remainder[: -len("/failed")])
-            return
-        if remainder.endswith("/lock"):
-            self.lock_present.add(remainder[: -len("/lock")])
-            return
-
-    def unavailable(self, region_id):
-        return region_id in self.done or region_id in self.failed or region_id in self.lock_present
+    def unavailable(self, region_key):
+        return region_key in self.done or region_key in self.failed or region_key in self.lock
 
 
-def load_state(repo, token, scope):
-    refs = common.list_matching_refs(repo, token, f"claims/{scope}")
-    return ClaimState(refs, prefix=f"refs/claims/{scope}/")
+def load_state(repo, token, state_branch, scope):
+    content, _ = common.get_json_file(repo, token, state_branch, claims_path(scope))
+    return ClaimState(content)
 
 
 def region_key_of(region_id):
     return "/".join(common.sanitize_ref_component(p) for p in region_id.split("/"))
 
 
+# Small on purpose: this bounds how many regions one crashed/OOM-killed/
+# timed-out worker can strand for the rest of a run (see ClaimState's
+# docstring) while still cutting the shared-file round trips claiming
+# "hundreds of leaves" (docs/ARCHITECTURE.md "Distribution") makes by
+# roughly this factor — 5 regions per read-modify-write instead of one full
+# ref listing plus a create per region is already most of the win; going
+# much bigger buys little further request-volume reduction against a much
+# worse crash blast radius.
+_DEFAULT_BATCH_SIZE = 5
+
+
+def _load_batch_cache(path):
+    p = pathlib.Path(path)
+    if not p.exists():
+        return []
+    with open(p) as f:
+        return json.load(f)
+
+
+def _save_batch_cache(path, regions):
+    with open(path, "w") as f:
+        json.dump(regions, f)
+
+
+def _claim_batch(repo, token, state_branch, scope, manifest, batch_size):
+    """One read-modify-write claims up to `batch_size` regions at once —
+    see the module docstring for why this, not one round trip per region,
+    is the actual fix for the request volume that was exhausting the
+    calling workflow's hourly GitHub API quota. `update_json_file_with_retry`
+    already retries the whole read-modify-write on a conflicting concurrent
+    write from another worker, re-picking a fresh batch against the
+    re-read state each attempt, so two workers racing this can't end up
+    with an overlapping batch."""
+    claimed = []
+
+    def mutate(content):
+        claimed.clear()
+        state = ClaimState(content)
+        locked = set(state.lock)
+        for region in manifest["regions"]:
+            if len(claimed) >= batch_size:
+                break
+            region_key = region_key_of(region["id"])
+            if region_key in locked or state.unavailable(region_key):
+                continue
+            claimed.append(region)
+            locked.add(region_key)
+        content["lock"] = sorted(locked)
+        return content
+
+    common.update_json_file_with_retry(
+        repo, token, state_branch, claims_path(scope), mutate,
+        message=f"claim up to {batch_size} region(s) for {scope!r}",
+    )
+    return claimed
+
+
 def cmd_next(args):
-    anchor_sha = common.ensure_branch(args.repo, args.token, args.state_branch)
-
-    with open(args.manifest) as f:
-        manifest = json.load(f)
-
-    scope = scope_prefix(args.output_basename)
-    state = load_state(args.repo, args.token, scope)
-
-    for region in manifest["regions"]:
-        region_key = region_key_of(region["id"])
-        if state.unavailable(region_key):
-            continue
-        # The actual race: a *fixed* ref name per region, so two workers
-        # racing for the same region collide on this exact create — only
-        # one can win (see ClaimState's docstring for why this must not
-        # have a timestamp or any other varying component in it).
+    batch = _load_batch_cache(args.batch_cache)
+    if not batch:
+        # ensure_branch is itself an API call (a GET, plus a POST the very
+        # first time ever) — only paid when the cache is actually empty and
+        # a real batch claim is about to happen, not on every cache-served
+        # call, or it would silently undo most of batching's point.
+        common.ensure_branch(args.repo, args.token, args.state_branch)
+        with open(args.manifest) as f:
+            manifest = json.load(f)
+        scope = scope_prefix(args.output_basename)
         try:
-            won = common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock", anchor_sha)
-        except requests.RequestException as exc:
+            batch = _claim_batch(args.repo, args.token, args.state_branch, scope, manifest, args.batch_size)
+        except common.TokenPermissionError:
+            raise
+        except (requests.RequestException, RuntimeError) as exc:
             # A persistent GitHub outage (5xx/network trouble surviving
-            # common._request's own retries) shouldn't crash this worker,
-            # and shouldn't burn its retry budget again on every remaining
-            # candidate in the manifest either — nothing was claimed here,
-            # so stop scanning and report the same as an empty queue, the
-            # same "log and continue" treatment cmd_done/cmd_failed give
-            # this class of failure.
-            print(f"::warning::claim scan for {args.output_basename} aborted early: {exc}", file=sys.stderr)
-            break
-        if not won:
-            continue  # lost the race for this one; try the next candidate
+            # common._request's own retries, or update_json_file_with_retry
+            # giving up after its own retry-on-conflict attempts) shouldn't
+            # crash this worker — nothing was claimed here, so report the
+            # same as an empty queue, the same "log and continue" treatment
+            # cmd_done/cmd_failed give this class of failure.
+            print(f"::warning::claim batch for {args.output_basename} failed: {exc}", file=sys.stderr)
+            batch = []
 
-        print(json.dumps({"claimed": True, "region": region}))
+    if not batch:
+        _save_batch_cache(args.batch_cache, [])
+        print(json.dumps({"claimed": False, "region": None}))
         return
 
-    print(json.dumps({"claimed": False, "region": None}))
+    region = batch.pop(0)
+    _save_batch_cache(args.batch_cache, batch)
+    print(json.dumps({"claimed": True, "region": region}))
 
 
 def cmd_done(args):
-    anchor_sha = common.ensure_branch(args.repo, args.token, args.state_branch)
-    scope = scope_prefix(args.output_basename)
-    region_key = region_key_of(args.region_id)
-
-    # Not raised on failure: a persistent GitHub outage (5xx/network trouble
-    # surviving common._request's own retries) landing here means the region
-    # already finished building — crashing this worker over it would abort
-    # its whole claim loop and strand every region still left in its queue,
-    # not just this one. Per ClaimState's docstring, a lock nothing ever
-    # releases is already an accepted state (indistinguishable from a worker
-    # that crashed outright) that cleanup_claims.py wipes at the end of the
-    # run regardless, so leaving it stuck here is strictly better than
-    # taking the whole worker down with it. TokenPermissionError (a real
-    # permissions problem, not a blip) is deliberately not caught here — see
-    # its docstring — and still propagates.
-    try:
-        common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/done", anchor_sha)
-        common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock")
-    except requests.RequestException as exc:
-        print(f"::warning::{args.region_id} done-marking failed, lock left stuck for this run: {exc}", file=sys.stderr)
-
-    # Duration goes to a local, per-worker file, not straight to the shared
-    # state/timings/<output_basename>.json — a worker claims tens of regions
-    # in a row, and this shared file is the one piece of per-region state
-    # *not* keyed by its own ref (unlike the claim/done/failed refs above),
-    # so writing it here on every single `done` turns it into a hot lock:
-    # `worker_count` workers finishing regions close together all race the
-    # same read-modify-write, and under a full fan-out that can exhaust
-    # update_json_file_with_retry's attempts outright. Appending to a local
-    # file is a pure filesystem write — no network round trip, so it can't
-    # collide with anything. cmd_flush_timings merges the whole buffer in
-    # one shared-file write per worker instead of one per region; see its
-    # docstring.
+    # No API call at all: outcome goes to a local, per-worker file, not
+    # straight to the shared claims file — a worker claims tens of regions
+    # in a row, and writing the shared file here on every single `done`
+    # would turn it into a hot lock (`worker_count` workers finishing
+    # regions close together all racing the same read-modify-write, which
+    # under a full fan-out can exhaust update_json_file_with_retry's
+    # attempts outright — see docs/ARCHITECTURE.md "Timing history & queue
+    # ordering" for why this exact pattern was already avoided for
+    # durations). Appending to a local file is a pure filesystem write — no
+    # network round trip, so it can't collide with anything, and can't fail
+    # the way the old create_ref/delete_ref pair here could. cmd_flush_timings
+    # merges every worker's buffer into the shared claims and timing-history
+    # files in one write each per run; see its docstring.
     with open(args.timings_buffer, "a") as f:
-        f.write(json.dumps({"region_id": args.region_id, "duration_seconds": args.duration_seconds}) + "\n")
+        f.write(json.dumps({
+            "region_id": args.region_id,
+            "status": "done",
+            "duration_seconds": args.duration_seconds,
+        }) + "\n")
 
     print(json.dumps({"ok": True}))
 
 
 def cmd_flush_timings(args):
-    """Merges every worker's locally buffered durations (from repeated
-    cmd_done calls, one JSON line each, uploaded as one artifact per worker)
-    into the shared timing-history file in a single read-modify-write for
-    the whole run — called exactly once, by a dedicated job downstream of
-    `build` (see `record-timings` in _pipeline.yml). This is the actual fix
-    for the contention cmd_done's docstring describes: not a smaller
-    worker-sized batch racing other workers' batches, but a single writer,
-    so there is no concurrent writer left to race at all.
+    """Merges every worker's locally buffered outcomes (from repeated
+    cmd_done/cmd_failed calls, one JSON line each, uploaded as one artifact
+    per worker) into the shared timing-history file and the shared claims
+    file's `done`/`failed` lists, one read-modify-write each, for the whole
+    run — called exactly once, by a dedicated job downstream of `build`
+    (see `record-timings` in _pipeline.yml). This is the actual fix for the
+    contention cmd_done's docstring describes: not a smaller worker-sized
+    batch racing other workers' batches, but a single writer, so there is
+    no concurrent writer left to race at all. It's also what finally
+    releases each region's `lock` entry (see ClaimState's docstring) —
+    unlike the old design, a region isn't durably done/failed until this
+    runs, so a worker that dies before its buffer artifact uploads loses
+    that outcome the same way it would lose an unuploaded shard file.
 
     `timings_dir` is searched recursively for buffer files (each worker's
     artifact lands in its own subdirectory after download-artifact, so
@@ -205,9 +261,14 @@ def cmd_flush_timings(args):
     run makes update_json_file_with_retry's attempts being exhausted far
     less likely than under per-region or per-worker writes, but GitHub API
     trouble unrelated to write contention (an outage, a persistent 5xx)
-    is still possible, and losing this run's timing sample is fine —
-    regions with no recorded history just fall back to byte-size ordering
-    (see docs/ARCHITECTURE.md "Timing history & queue ordering")."""
+    is still possible. Losing this run's timing sample is fine — regions
+    with no recorded history just fall back to byte-size ordering (see
+    docs/ARCHITECTURE.md "Timing history & queue ordering"). Losing the
+    claims flush is not fine for this run's completeness (those regions
+    stay `remaining` and `finalize_check.py --fail-if-incomplete` fails the
+    run below), but is still not raised here — this job runs unconditionally
+    and independently of `verify-complete` precisely so one failed `build`
+    leg's timing data isn't lost over it; a warning is enough."""
     entries = []
     if args.timings_dir and pathlib.Path(args.timings_dir).is_dir():
         for path in sorted(pathlib.Path(args.timings_dir).rglob("*")):
@@ -220,38 +281,65 @@ def cmd_flush_timings(args):
         print(json.dumps({"flushed": 0}))
         return
 
-    def apply_batch(timings):
-        for entry in entries:
-            history = timings.get(entry["region_id"], [])
-            history = (history + [entry["duration_seconds"]])[-5:]
-            timings[entry["region_id"]] = history
-        return timings
+    done_entries = [e for e in entries if e.get("status") == "done"]
+    failed_entries = [e for e in entries if e.get("status") == "failed"]
+
+    if done_entries:
+        def apply_timings(timings):
+            for entry in done_entries:
+                history = timings.get(entry["region_id"], [])
+                history = (history + [entry["duration_seconds"]])[-5:]
+                timings[entry["region_id"]] = history
+            return timings
+
+        try:
+            common.update_json_file_with_retry(
+                args.repo, args.token, args.state_branch,
+                leaves.timings_path(args.output_basename),
+                apply_timings,
+                message=f"record timing for {len(done_entries)} region(s)",
+            )
+        except RuntimeError as exc:
+            print(f"::warning::timing history flush failed for {len(done_entries)} region(s): {exc}", file=sys.stderr)
+
+    scope = scope_prefix(args.output_basename)
+
+    def apply_claims(content):
+        state = ClaimState(content)
+        lock, done, failed = set(state.lock), set(state.done), set(state.failed)
+        for entry in done_entries:
+            key = region_key_of(entry["region_id"])
+            lock.discard(key)
+            done.add(key)
+        for entry in failed_entries:
+            key = region_key_of(entry["region_id"])
+            lock.discard(key)
+            failed.add(key)
+        content["lock"] = sorted(lock)
+        content["done"] = sorted(done)
+        content["failed"] = sorted(failed)
+        return content
 
     try:
         common.update_json_file_with_retry(
-            args.repo, args.token, args.state_branch,
-            leaves.timings_path(args.output_basename),
-            apply_batch,
-            message=f"record timing for {len(entries)} region(s)",
+            args.repo, args.token, args.state_branch, claims_path(scope), apply_claims,
+            message=f"record {len(done_entries)} done, {len(failed_entries)} failed region(s) for {scope!r}",
         )
     except RuntimeError as exc:
-        print(f"::warning::timing history flush failed for {len(entries)} region(s): {exc}", file=sys.stderr)
+        print(f"::warning::claims flush failed for {len(entries)} region(s): {exc}", file=sys.stderr)
+
     print(json.dumps({"flushed": len(entries)}))
 
 
 def cmd_failed(args):
-    anchor_sha = common.ensure_branch(args.repo, args.token, args.state_branch)
-    scope = scope_prefix(args.output_basename)
-    region_key = region_key_of(args.region_id)
-
-    # See cmd_done's matching try/except: same reasoning applies here, so a
-    # transient GitHub outage strands one lock instead of this worker's
-    # whole remaining queue.
-    try:
-        common.create_ref(args.repo, args.token, f"claims/{scope}/{region_key}/failed", anchor_sha)
-        common.delete_ref(args.repo, args.token, f"claims/{scope}/{region_key}/lock")
-    except requests.RequestException as exc:
-        print(f"::warning::{args.region_id} failed-marking failed, lock left stuck for this run: {exc}", file=sys.stderr)
+    # See cmd_done's docstring: same "no API call, buffer locally" reasoning
+    # applies here.
+    with open(args.timings_buffer, "a") as f:
+        f.write(json.dumps({
+            "region_id": args.region_id,
+            "status": "failed",
+            "error": args.error,
+        }) + "\n")
     if args.error:
         print(f"::warning::{args.region_id} failed: {args.error}", file=sys.stderr)
     print(json.dumps({"permanently_failed": True}))
@@ -271,19 +359,22 @@ def main():
     p_next = sub.add_parser("next")
     _add_common_args(p_next)
     p_next.add_argument("--manifest", required=True)
+    p_next.add_argument("--batch-size", type=int, default=_DEFAULT_BATCH_SIZE, help="Regions to claim per shared-file read-modify-write; see _DEFAULT_BATCH_SIZE.")
+    p_next.add_argument("--batch-cache", required=True, help="Local file this worker's still-unclaimed batch is cached in between calls, so only every Nth `next` call touches the API.")
     p_next.set_defaults(func=cmd_next)
 
     p_done = sub.add_parser("done")
     _add_common_args(p_done)
     p_done.add_argument("--region-id", required=True)
     p_done.add_argument("--duration-seconds", type=int, required=True)
-    p_done.add_argument("--timings-buffer", required=True, help="Local file this worker's durations are appended to; see cmd_flush_timings.")
+    p_done.add_argument("--timings-buffer", required=True, help="Local file this worker's outcomes are appended to; see cmd_flush_timings.")
     p_done.set_defaults(func=cmd_done)
 
     p_failed = sub.add_parser("failed")
     _add_common_args(p_failed)
     p_failed.add_argument("--region-id", required=True)
     p_failed.add_argument("--error", default="")
+    p_failed.add_argument("--timings-buffer", required=True, help="Local file this worker's outcomes are appended to; see cmd_flush_timings.")
     p_failed.set_defaults(func=cmd_failed)
 
     p_flush = sub.add_parser("flush-timings")
