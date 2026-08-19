@@ -123,46 +123,78 @@ still call the pipeline for more than one `output_basename` (e.g. two
 different layers), so claims and timing history are still scoped by
 `output_basename` within that repo's own branch — see below.
 
-## Locking: a shared JSON claims file, claimed in small batches
+## Locking: one shared JSON queue file, claimed in small batches
 
 Up to `worker_count` workers can race to claim the same region. Each build
 (within this repo) has its own scope key identifying which one is running:
-`state/claims/<output_basename>.json` — e.g. a `bins` layer build claims
-against `state/claims/bins.json`, and a call building `bins` and `roads`
+`state/queue/<output_basename>.json` — e.g. a `bins` layer build claims
+against `state/queue/bins.json`, and a call building `bins` and `roads`
 together (see "Multiple layers, one download" below) claims against
-`state/claims/bins,roads.json` — the raw input value, comma(s) and all, is
+`state/queue/bins,roads.json` — the raw input value, comma(s) and all, is
 the scope; it isn't split apart or deduplicated against a separate
 `bins`-only build's own scope, since those really are different builds with
-independent claim/timing history. The file holds three lists of region
-keys (region IDs with git-ref-unsafe characters stripped, a holdover from
-this scheme's predecessor — see below): `lock`, `done`, `failed`.
+independent claim/timing history. This one file *is* the queue: a
+`remaining` list (every leaf still up for grabs, `{"id", "pbf_url"}` each,
+longest-first — see "Timing history & queue ordering" for how that order is
+computed) plus three plain region-id lists — `lock`, `done`, `failed`. The
+`prepare` job seeds it once at the start of the run (`leaves.py`'s
+`write_queue`); from there, claiming a region means popping it out of
+`remaining` and into `lock`.
 
-**This replaced an earlier one-git-ref-per-region design** (atomic
-`POST /repos/.../git/refs`, one ref per region under
-`refs/claims/<scope>/<region-id>/...`, relying on its 422-on-exists for
-compare-and-swap). That design's atomicity was real, but it was also
-*maximally chatty*: `claim.py next` re-listed the whole scope's refs on
-every single region grabbed, and `done`/`failed` each cost their own
-create+delete — across `worker_count` workers times "hundreds of leaves"
-(see "Distribution"), a full run made thousands of GitHub API calls. That
-routinely exhausted the calling workflow's GITHUB_TOKEN's primary hourly
-quota (GitHub's "API rate limit exceeded for installation" — distinct from,
-and much slower to clear than, the secondary/abuse-detection limit
-`common.py`'s retry/backoff is tuned for), no matter how well-tuned the
-retry logic was — the fix had to be fewer requests, not smarter waiting.
-Git refs also have no bulk-create endpoint, so that per-region request cost
-was structural, not a tuning problem.
+**This replaced two earlier designs**, in order:
 
-The JSON file *can* batch: `claim.py next` claims up to `--batch-size`
-(default 5) regions in a single `update_json_file_with_retry` read-modify-
-write, caching the rest locally (`--batch-cache`) so a worker only touches
-the shared file once every `--batch-size` regions instead of once per
-region. `update_json_file_with_retry` already retries the whole
-read-modify-write on a conflicting concurrent write from another worker,
-re-picking a fresh batch against the freshly-read state each attempt, so
-two workers racing this can't end up with an overlapping batch — the same
-correctness guarantee the old ref-per-region compare-and-swap gave, just
-amortized over a batch instead of paid per region.
+1. One git ref per region (atomic `POST /repos/.../git/refs`, one ref under
+   `refs/claims/<scope>/<region-id>/...`, relying on its 422-on-exists for
+   compare-and-swap). Real atomicity, but *maximally chatty*: `claim.py
+   next` re-listed the whole scope's refs on every single region grabbed,
+   and `done`/`failed` each cost their own create+delete — across
+   `worker_count` workers times "hundreds of leaves" (see "Distribution"),
+   a full run made thousands of GitHub API calls, routinely exhausting the
+   calling workflow's GITHUB_TOKEN's primary hourly quota (GitHub's "API
+   rate limit exceeded for installation" — distinct from, and much slower
+   to clear than, the secondary/abuse-detection limit `common.py`'s
+   retry/backoff is tuned for). Git refs also have no bulk-create endpoint,
+   so that per-region request cost was structural, not a tuning problem.
+2. A JSON claims file claimed in batches (`state/claims/<scope>.json`,
+   holding only `lock`/`done`/`failed`), read against a *separate*,
+   read-only `queue-manifest.json` — the sorted candidate list — built once
+   by `prepare` and passed to every job as a workflow artifact. This fixed
+   the request-volume problem (batching, below), but kept the sorted
+   candidate list and the claim state as two independently-fetched sources
+   of truth that every consumer (`claim.py`, `finalize_check.py`) had to
+   cross-reference by hand, and needed an upload/download roundtrip through
+   3 separate jobs for data that never actually changed during the run.
+   Merging the two removes that roundtrip and the cross-referencing: a
+   region's presence in `remaining` already *is* "still claimable", with no
+   second file to check it against.
+
+Region ids go straight into these lists as plain strings — no
+git-ref-safe-character stripping. That sanitization existed only because
+the first design above embedded region ids literally into git ref names;
+nothing here does that anymore, so `scripts/common.py`'s
+`sanitize_ref_component` is unused for this purpose (it's still used for
+`ensure_branch`'s own ref handling, unrelated to the queue). Two fields
+travel with each `remaining` entry, not one, even though a region id alone
+would be a unique key: `pbf_url` isn't derivable from `id` (Geofabrik's own
+`urls.pbf` field is fetched from `index-v1.json`, not constructed — see
+`leaves.py`'s module docstring for a concrete counterexample: `us/wisconsin`
+corrects Geofabrik's `parent: north-america` via `effective_parent` so
+`--region-scope us` can prefix-match every state, but the *URL* path is
+still `north-america/us/wisconsin`, since Geofabrik's own site structure
+doesn't get that correction). Keeping `id` as the real key (not a URL
+fragment) is also what keeps `state/timings/<output_basename>.json`'s keys
+stable independent of Geofabrik's own URL/CDN choices.
+
+The file *can* batch: `claim.py next` claims up to `--batch-size` (default
+5) regions in a single `update_json_file_with_retry` read-modify-write,
+caching the rest locally (`--batch-cache`) so a worker only touches the
+shared file once every `--batch-size` regions instead of once per region.
+`update_json_file_with_retry` already retries the whole read-modify-write
+on a conflicting concurrent write from another worker, re-picking a fresh
+batch against the freshly-read `remaining` each attempt, so two workers
+racing this can't end up with an overlapping batch — the same correctness
+guarantee the original ref-per-region compare-and-swap gave, just amortized
+over a batch instead of paid per region.
 
 `done`/`failed` don't touch the shared file at all, to avoid turning it
 into the exact hot lock `state/timings/...json` already had to avoid (see
@@ -172,7 +204,7 @@ to the same local per-worker buffer file timing durations already used
 (`--timings-buffer`, now carrying a `status` per line too), and
 `flush-timings` — run once, by a single dedicated job after `build`
 finishes — merges every worker's buffer into the shared file's `done`/
-`failed` lists (moving the matching keys out of `lock`) in one
+`failed` lists (moving the matching ids out of `lock`) in one
 read-modify-write for the whole run. See `cmd_flush_timings`'s docstring in
 `scripts/claim.py`.
 
@@ -185,31 +217,37 @@ them — stuck for the rest of the run: there is no second round to pick
 them up (see "Worker job shape & the 6-hour limit"), and no amount of extra
 `worker_count` reclaims them either, since every other worker still treats
 an existing `lock` entry as unavailable regardless of who (or what) is
-behind it. This is the one real cost of batching over the old one-ref-per-
-region design (a crash strands up to `--batch-size` regions instead of
-exactly one) — kept small by keeping `--batch-size` small, and accepted for
-the same reason the old design accepted it: `cleanup_claims.py` resets the
-whole scope's file at the end of the run regardless of how it went (see
-below), so a stuck lock can't outlive the run it happened in, and the
-practical cost is that the *specific regions* affected need a manual rerun
-(e.g. via `region_scope`) rather than the whole run self-healing through a
-second pass. A lease/timestamp per lock entry, enabling reclaim *within* a
-still-running run rather than only at the next run, is an obvious extension
-if stuck batches turn out to be a real, recurring problem in practice —
-deliberately not built preemptively (see "Deliberately deferred").
+behind it. This is the one real cost of batching over the original
+one-ref-per-region design (a crash strands up to `--batch-size` regions
+instead of exactly one) — kept small by keeping `--batch-size` small, and
+accepted for the same reason the original design accepted it:
+`cleanup_claims.py` resets the whole scope's file at the end of the run
+regardless of how it went (see below), so a stuck lock can't outlive the
+run it happened in, and the practical cost is that the *specific regions*
+affected need a manual rerun (e.g. via `region_scope`) rather than the
+whole run self-healing through a second pass. A lease/timestamp per lock
+entry, enabling reclaim *within* a still-running run rather than only at
+the next run, is an obvious extension if stuck batches turn out to be a
+real, recurring problem in practice — deliberately not built preemptively
+(see "Deliberately deferred").
 
-Why a shared file at all, when the old design's docs used to argue against
-one: that argument was about *per-claim* writes — a naive "every claim is
-its own read-modify-write" design does need the same retry-on-conflict
-handling refs avoided, without refs' create-if-absent guarantee. Batching
-doesn't remove that per-write contention risk, it just amortizes it over
-`--batch-size` regions per write instead of one — the same tradeoff
-`state/timings/...json` already made (see below) for exactly this reason.
-What actually changed the calculus here is that request *volume*, not
-per-write atomicity, turned out to be the thing actually breaking runs.
+Why a shared file at all, when the original design's docs used to argue
+against one: that argument was about *per-claim* writes — a naive "every
+claim is its own read-modify-write" design does need the same
+retry-on-conflict handling refs avoided, without refs' create-if-absent
+guarantee. Batching doesn't remove that per-write contention risk, it just
+amortizes it over `--batch-size` regions per write instead of one — the
+same tradeoff `state/timings/...json` already made (see below) for exactly
+this reason. What actually changed the calculus here is that request
+*volume*, not per-write atomicity, turned out to be the thing actually
+breaking runs. Merging in the read-only candidate list on top of that adds
+some bytes to each batch write (`pbf_url` per entry), but that's tens of KB
+even for a "hundreds of leaves" run — negligible next to the request-volume
+problem that motivated batching in the first place, and irrelevant to it
+(payload size and request count are independent costs).
 
-Claims are scoped by `output_basename`, deliberately **not** by a run ID on
-top of that: the finalize job resets the scope's file at the end of each
+The queue is scoped by `output_basename`, deliberately **not** by a run ID
+on top of that: the finalize job resets the scope's file at the end of each
 run — success or failure (`if: always()`) — so retries always start from a
 clean slate rather than resuming partway (kept simple on purpose: this
 pipeline is a periodic full rebuild, not an incremental one, so there's no
@@ -221,7 +259,11 @@ tiledistillery-${{ github.repository }}-${{ inputs.output_basename }},
 cancel-in-progress: false` (reusable `workflow_call` workflows can declare
 `concurrency:` the same as any other workflow), so a caller doesn't have to
 remember to serialize its own calls — it's enforced for every caller by
-construction.
+construction. This is also why `write_queue` can overwrite the scope's file
+unconditionally (via `update_json_file_with_retry`, but only for its
+"fetch current sha, then write" shape, not for genuine conflict retry):
+nothing else can be writing this scope concurrently, and the prior run's
+`cleanup` already reset whatever was there.
 
 ## Timing history & queue ordering
 
@@ -233,8 +275,8 @@ append each region's outcome to a local per-worker file
 (`--timings-buffer`); the `build` job uploads that file as an artifact the
 same way it uploads shards; and `record-timings`, which runs once after
 `build` finishes, downloads every worker's buffer and merges all of it into
-the shared timing-history file **and** the shared claims file (see
-"Locking" — this is also what moves each region's key from `lock` into
+the shared timing-history file **and** the shared queue file (see
+"Locking" — this is also what moves each region's id from `lock` into
 `done`/`failed`) in one read-modify-write each
 (`claim.py flush-timings --timings-dir`). It runs unconditionally
 (`if: always()`), so a run that ultimately fails `verify-complete` still
@@ -242,7 +284,7 @@ keeps whatever timing data it produced — but `verify-complete` itself now
 *waits* on this job (not just on `build`), since it's the one that applies
 the claims half of that flush; timing history alone would have stayed
 independent (it only feeds *future* runs' queue ordering, never this run's
-correctness), but claims completeness is this run's correctness.
+correctness), but queue completeness is this run's correctness.
 
 This exists because the file is shared and *not* keyed by its own ref the
 way claims used to be (see "Locking") — a naive "every worker writes it
@@ -255,7 +297,7 @@ mid-run (see `cmd_done`'s docstring in `scripts/claim.py`). Funneling every
 write through one job, once, doesn't just reduce that collision rate — it
 removes the concurrent-writer problem this file has entirely, since after
 `build` finishes there is nothing left running that could race
-`record-timings`'s own single write. The claims file's own batched writes
+`record-timings`'s own single write. The queue file's own batched writes
 during `build` (see "Locking") don't get this same "wait until nothing's
 running" treatment — those still need to happen *during* the run, since
 that's what claiming actually is — only their `done`/`failed` half is
@@ -264,22 +306,23 @@ deferred this way.
 building more than one layer together (e.g. `state/timings/bins,roads.json`)
 — building `bins,roads` together and calling this pipeline for `bins` alone
 are different scopes with different histories, and that's intentional (see
-below), not an oversight. Scoped this way for the same reason as claims
+below), not an oversight. Scoped this way for the same reason as the queue
 (see "Locking") and for an additional reason of its own: build time is a
 property of the *whole set* of configs sharing one download+build pass —
 building `bins` alone takes less time per region than building
 `bins,roads` together, so their histories shouldn't mix, and building
 `bins,roads` together isn't well-modeled as "the sum of bins's own history
-and roads's own history" either, since the download is shared. Unlike
-claims, this file is *not* reset between runs — history is exactly what's
+and roads's own history" either, since the download is shared. Unlike the
+queue, this file is *not* reset between runs — history is exactly what's
 meant to persist. The `prepare` job sorts the full leaf
-list by mean recorded duration, **longest first**, so the last regions
-claimed near the end of a run are the small ones — the failure mode being
-avoided is one 30-minute outlier (e.g. Russia) still running while every
-other worker has gone idle, which longest-first ordering directly prevents
-(oversized leaves are deliberately *not* subdivided further — see "Region
-detection" — specifically so this ordering, not finer sharding, is what
-absorbs the size skew).
+list by mean recorded duration, **longest first**, before seeding
+`state/queue/<scope>.json`'s `remaining` list with it (see "Locking"), so
+the last regions claimed near the end of a run are the small ones — the
+failure mode being avoided is one 30-minute outlier (e.g. Russia) still
+running while every other worker has gone idle, which longest-first
+ordering directly prevents (oversized leaves are deliberately *not*
+subdivided further — see "Region detection" — specifically so this
+ordering, not finer sharding, is what absorbs the size skew).
 
 A region with no timing history yet (new leaf, or the very first run) falls
 back to sorting by its `.osm.pbf` byte size. Geofabrik's `index-v1.json`
@@ -420,9 +463,9 @@ Three jobs, after the claim-loop completes:
    artifact — pipeline still does not publish anywhere itself, same
    separation of concerns as TileAlchemist's `_pipeline.yml`.
 3. **`cleanup`**, `if: always()`: resets this run's
-   `state/claims/<output_basename>.json` to empty (logging any `failed`
+   `state/queue/<output_basename>.json` to empty (logging any `failed`
    ones first), so the next run of the same build starts with a clean
-   claims file regardless of how this one ended.
+   queue file regardless of how this one ended.
 
 ## State branch
 
@@ -433,10 +476,11 @@ in `foxandfeature/tiledistillery`. Holds only:
 | Path | What | Written by |
 |---|---|---|
 | `state/timings/<output_basename>.json` | last ≤5 durations per region-id, persists across runs | `record-timings` job, once per run |
-| `state/claims/<output_basename>.json` | `{"lock": [...], "done": [...], "failed": [...]}` region keys (see "Locking") | `lock` batched during `build`; `done`/`failed` by `record-timings`, once per run |
+| `state/queue/<output_basename>.json` | `{"remaining": [{"id", "pbf_url"}, ...], "lock": [...], "done": [...], "failed": [...]}` (see "Locking") | seeded by `prepare`; `remaining`/`lock` batched during `build`; `done`/`failed` by `record-timings`, once per run |
 
-The claims file is reset to empty at the end of each run (see "Merge" step
-3); the timings file is not — history is what's meant to persist.
+The queue file is reset to empty at the end of each run (see "Merge" step
+3), then reseeded by the next run's `prepare` job; the timings file is not
+reset — history is what's meant to persist.
 
 Shard binaries (`.mbtiles`) and the final `.pmtiles` are **never** committed
 here — they're GitHub Actions artifacts, exactly like TileAlchemist's shard
@@ -499,7 +543,7 @@ workflow must still provide, since `_pipeline.yml` deliberately never
 touches any repository but the caller's own (see "State lives in the
 caller's repo, not this one"): `permissions: contents: write` (job- or
 workflow-level), needed to create/read/write the caller's own `state`
-branch and its claims file. (Serializing repeated calls is *not* the
+branch and its queue file. (Serializing repeated calls is *not* the
 caller's job — see "Locking" — `_pipeline.yml` enforces that itself.)
 
 This repo's own `ci.yml` (see "CI self-test") shows the minimal caller shape.
