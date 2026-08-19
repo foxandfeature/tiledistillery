@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Build the run's queue manifest: every Geofabrik leaf extract in scope,
-ordered longest-first. See docs/ARCHITECTURE.md "Region detection" and
-"Timing history & queue ordering".
+"""Seeds the run's queue: every Geofabrik leaf extract in scope, ordered
+longest-first, written straight to state/queue/<scope>.json on the calling
+repository's own `state` branch (see write_queue). See
+docs/ARCHITECTURE.md "Region detection" and "Timing history & queue
+ordering".
 
 A leaf's region-id is its full path through the Geofabrik parent chain
 (e.g. "europe/germany/bavaria"), not Geofabrik's own short `id` field
 (e.g. "bavaria") — ids are unique on their own, but the path is what lets
---region-scope filter a whole subtree by prefix, and reads far better as a
-git ref / artifact name.
+--region-scope filter a whole subtree by prefix (see in_scope), and is what
+`state/timings/<output_basename>.json` is keyed by, independent of
+Geofabrik's own URL/CDN structure (`pbf_url` alone doesn't preserve this:
+e.g. Geofabrik's own `north-america/us/wisconsin` URL path doesn't reflect
+the `effective_parent` correction that makes this leaf's id `us/wisconsin`,
+not `north-america/us/wisconsin` — see effective_parent below).
 """
 
 import argparse
 import concurrent.futures
-import json
 import statistics
 import sys
 
@@ -160,6 +165,10 @@ def timings_path(output_basename):
     return f"state/timings/{output_basename}.json"
 
 
+def queue_path(scope):
+    return f"state/queue/{scope}.json"
+
+
 def build_manifest(region_scope, repo, token, state_branch, output_basename):
     features = fetch_index()
     paths = compute_paths(features)
@@ -204,7 +213,40 @@ def build_manifest(region_scope, repo, token, state_branch, output_basename):
     # Secondary, within each group: longest/largest first.
     regions.sort(key=lambda r: (not r["has_history"], -r["sort_metric"]))
 
-    return {"region_scope": region_scope, "regions": regions}
+    # has_history/sort_metric only exist to compute this order; the order
+    # itself is what's worth keeping (as array position in the persisted
+    # queue, see write_queue), not the metrics that produced it.
+    return {
+        "region_scope": region_scope,
+        "regions": [{"id": r["id"], "pbf_url": r["pbf_url"]} for r in regions],
+    }
+
+
+def write_queue(region_scope, repo, token, state_branch, output_basename, scope):
+    """Builds this run's queue (see build_manifest) and seeds
+    state/queue/<scope>.json with it — `remaining` holds the full,
+    longest-first-sorted candidate list, `lock`/`done`/`failed` start empty.
+    See docs/ARCHITECTURE.md "Locking": this *is* the queue from here on,
+    not a separate read-only artifact — claim.py pops entries off
+    `remaining` directly.
+
+    Unconditional overwrite (via update_json_file_with_retry, ignoring
+    whatever content is already there) rather than a plain create: the prior
+    run's cleanup_claims.py already reset this scope's file to `{}`, but
+    didn't delete it, so a plain create-only write would 409 against that
+    leftover file. No concurrent writer to actually race here — the calling
+    workflow's own `concurrency:` group already serializes overlapping runs
+    of the same scope — so this reuses update_json_file_with_retry purely
+    for its "read current sha, then write" shape, not for conflict retry.
+    """
+    manifest = build_manifest(region_scope, repo, token, state_branch, output_basename)
+    content = {"remaining": manifest["regions"], "lock": [], "done": [], "failed": []}
+    common.update_json_file_with_retry(
+        repo, token, state_branch, queue_path(scope),
+        lambda _content: content,
+        message=f"seed queue for {scope!r} ({len(content['remaining'])} region(s))",
+    )
+    return content
 
 
 def main():
@@ -214,16 +256,14 @@ def main():
     parser.add_argument("--token", required=True)
     parser.add_argument("--state-branch", default="state")
     parser.add_argument("--output-basename", required=True)
-    parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
-    manifest = build_manifest(
-        args.region_scope, args.repo, args.token, args.state_branch, args.output_basename,
+    scope = common.sanitize_ref_component(args.output_basename)
+    content = write_queue(
+        args.region_scope, args.repo, args.token, args.state_branch, args.output_basename, scope,
     )
-    with open(args.out, "w") as f:
-        json.dump(manifest, f, indent=2)
 
-    print(f"{len(manifest['regions'])} region(s) in scope {args.region_scope!r}, written to {args.out}", file=sys.stderr)
+    print(f"{len(content['remaining'])} region(s) in scope {args.region_scope!r}, written to {queue_path(scope)}", file=sys.stderr)
 
 
 if __name__ == "__main__":

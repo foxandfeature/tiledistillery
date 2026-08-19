@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Compares the run's manifest against the current claims-file state on the
-calling repository's own `state` branch. Prints one JSON object
+"""Reads the run's queue state directly from the calling repository's own
+`state` branch. Prints one JSON object
 `{"done": [...], "failed": [...], "remaining": [...]}` (region ids) to
-stdout. `remaining` is what's neither done nor permanently failed — a
-non-empty `remaining` once the claim-loop round is finished means the run
-is incomplete (see docs/ARCHITECTURE.md "Merge"): either the queue never
-got claimed in time, a worker crashed mid-build and left its claimed
-batch's lock entries stuck (see docs/ARCHITECTURE.md "Locking"), or a
-worker finished its regions but its outcome buffer never made it into
-`flush-timings` (see cmd_flush_timings in claim.py). This is why
-`verify-complete` (the job that runs this) waits on `record-timings` (the
-job that runs `flush-timings`), not just on `build`.
+stdout. `remaining` is what's neither done nor permanently failed (still in
+the queue's own `remaining` list, or still `lock`ed) — a non-empty
+`remaining` once the claim-loop round is finished means the run is
+incomplete (see docs/ARCHITECTURE.md "Merge"): either the queue never got
+claimed in time (a worker exiting cleanly on its own time budget, see
+"Worker job shape & the 6-hour limit" — no job ever fails for this case), a
+worker crashed mid-build and left its claimed batch's lock entries stuck
+(see docs/ARCHITECTURE.md "Locking"), or a worker finished its regions but
+its outcome buffer never made it into `flush-timings` (see
+cmd_flush_timings in claim.py). This is why `verify-complete` (the job that
+runs this) waits on `record-timings` (the job that runs `flush-timings`),
+not just on `build`.
 
 With --fail-if-incomplete, exits non-zero (after printing the JSON) when
 `remaining` is non-empty, for use as the very last check before merging.
@@ -25,7 +28,6 @@ import claim
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", required=True)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--state-branch", default="state")
@@ -33,22 +35,12 @@ def main():
     parser.add_argument("--fail-if-incomplete", action="store_true")
     args = parser.parse_args()
 
-    with open(args.manifest) as f:
-        manifest = json.load(f)
-
     scope = claim.scope_prefix(args.output_basename)
     state = claim.load_state(args.repo, args.token, args.state_branch, scope)
 
-    done, failed, remaining = [], [], []
-    for region in manifest["regions"]:
-        region_id = region["id"]
-        region_key = claim.region_key_of(region_id)
-        if region_key in state.done:
-            done.append(region_id)
-        elif region_key in state.failed:
-            failed.append(region_id)
-        else:
-            remaining.append(region_id)
+    done = sorted(state.done)
+    failed = sorted(state.failed)
+    remaining = sorted({r["id"] for r in state.remaining} | state.lock)
 
     result = {"done": done, "failed": failed, "remaining": remaining}
     print(json.dumps(result))

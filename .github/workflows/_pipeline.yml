@@ -24,7 +24,7 @@ name: TileDistillery pipeline (reusable)
 # — that's the calling workflow's job, same separation as TileAlchemist's
 # _pipeline.yml.
 #
-# State (claim refs + timing history) lives on the CALLING repo's own
+# State (queue/claim state + timing history) lives on the CALLING repo's own
 # `state` branch, never in this repo — see docs/ARCHITECTURE.md "State
 # lives in the caller's repo, not this one". The caller must grant
 # `permissions: contents: write`; this workflow's own `concurrency:` group
@@ -105,20 +105,19 @@ jobs:
 
       - run: pip install -r .tiledistillery/scripts/requirements.txt
 
-      - name: Build the run's queue manifest
+      # Seeds state/queue/<scope>.json directly on the state branch — see
+      # docs/ARCHITECTURE.md "Locking": this *is* the queue every worker
+      # claims from below, not a separate read-only artifact, so there's no
+      # upload/download roundtrip to plumb through `build`/`verify-complete`
+      # anymore.
+      - name: Seed this run's queue
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python .tiledistillery/scripts/leaves.py \
             --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
             --state-branch state --output-basename "${{ inputs.output_basename }}" \
-            --region-scope "${{ inputs.region_scope }}" \
-            --out queue-manifest.json
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: queue-manifest
-          path: queue-manifest.json
+            --region-scope "${{ inputs.region_scope }}"
 
       - id: gen-workers
         env:
@@ -147,10 +146,6 @@ jobs:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
           path: .tiledistillery
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: queue-manifest
 
       - uses: ./.tiledistillery/.github/actions/claim-and-build
         with:
@@ -184,7 +179,7 @@ jobs:
   # Centralizes timing-history *and* claim-outcome recording into a single
   # writer for the whole run, instead of every worker (or even every worker
   # once) writing the shared state/timings/<output_basename>.json or
-  # state/claims/<scope>.json itself — see docs/ARCHITECTURE.md "Timing
+  # state/queue/<scope>.json itself — see docs/ARCHITECTURE.md "Timing
   # history & queue ordering" and cmd_done/cmd_flush_timings in
   # scripts/claim.py for why per-writer contention on those files was a
   # real problem, not just a theoretical one. The timing-history half is
@@ -192,9 +187,9 @@ jobs:
   # queue ordering, never this run's correctness) and runs unconditionally
   # so a run that ultimately fails verify-complete still keeps whatever
   # timing data it produced — but the claims half is what actually applies
-  # every worker's buffered done/failed outcomes to the shared file (see
-  # cmd_flush_timings's docstring), so verify-complete now waits on this
-  # job too, not just on `build`. `if: always()` also means one failed
+  # every worker's buffered done/failed outcomes to the shared queue file
+  # (see cmd_flush_timings's docstring), so verify-complete now waits on
+  # this job too, not just on `build`. `if: always()` also means one failed
   # `build` matrix leg doesn't cost every other, healthy leg's timing data
   # or claim outcomes.
   record-timings:
@@ -248,7 +243,7 @@ jobs:
   # did finish has already buffered its claims locally regardless of a
   # sibling leg's own outcome. Needs `record-timings` too, not just `build`:
   # that's the job that actually applies those buffered outcomes to the
-  # shared claims file (see its comment above) — without waiting on it,
+  # shared queue file (see its comment above) — without waiting on it,
   # every region would still read back as `remaining` here even on a
   # perfectly healthy run.
   verify-complete:
@@ -271,10 +266,6 @@ jobs:
 
       - run: pip install -r .tiledistillery/scripts/requirements.txt
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: queue-manifest
-
       - name: Confirm every region is done or permanently failed
         env:
           GH_TOKEN: ${{ github.token }}
@@ -282,7 +273,7 @@ jobs:
           python .tiledistillery/scripts/finalize_check.py \
             --repo "$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
             --state-branch state --output-basename "${{ inputs.output_basename }}" \
-            --manifest queue-manifest.json --fail-if-incomplete
+            --fail-if-incomplete
 
   # One flat merge per output_basename, deliberately not staged by
   # continent — see docs/ARCHITECTURE.md "Merge". Each worker already
@@ -372,11 +363,11 @@ jobs:
           path: ${{ matrix.basename }}.pmtiles
 
   # Only actually needs verify-complete: that's the last job that reads
-  # claim state (finalize_check.py's completeness check), so it's the only
+  # queue state (finalize_check.py's completeness check), so it's the only
   # thing cleanup must wait behind — and verify-complete itself already
-  # waits on record-timings (the job that writes claim state), so this
+  # waits on record-timings (the job that writes queue state), so this
   # transitively runs after that write too without needing to depend on it
-  # directly. merge never touches claim state at all (shards artifacts
+  # directly. merge never touches queue state at all (shards artifacts
   # only), so gating cleanup on it too would just delay it for no reason —
   # it runs as soon as verify-complete finishes, in parallel with merge
   # instead of after it.
@@ -400,7 +391,7 @@ jobs:
 
       - run: pip install -r .tiledistillery/scripts/requirements.txt
 
-      - name: Reset claim state for this run
+      - name: Reset queue state for this run
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
