@@ -2,15 +2,15 @@ name: CI self-test
 
 # Exercises the full pipeline end to end against two minimal dummy
 # tilemaker configs built together (see docs/ARCHITECTURE.md "CI
-# self-test") — not real layers, just enough to prove config-referencing,
+# self-test"), not real layers, just enough to prove config-referencing,
 # sharding, claiming, and merge work, *and* that building more than one
 # output_basename in one call shares a single download per region (see
 # docs/ARCHITECTURE.md "Distribution"). Scoped to a single tiny leaf so
 # this runs in minutes, not a whole-world build. Also the reference
 # example of the minimal shape any caller needs (see
 # docs/ARCHITECTURE.md "Consumer contract"): call _pipeline.yml with
-# `permissions: contents: write` and nothing else — no concurrency group to
-# set up, _pipeline.yml enforces that itself.
+# `permissions: contents: write` and nothing else. No concurrency group to
+# set up, since _pipeline.yml enforces that itself.
 
 on:
   push:
@@ -27,6 +27,6 @@ jobs:
       config: dummy/config.json,dummy/config-amenity.json
       process: dummy/process.lua,dummy/process-amenity.lua
       output_basename: ci-dummy-place,ci-dummy-amenity
-      attribution: "TileDistillery CI self-test — data (c) OpenStreetMap contributors, ODbL"
+      attribution: "TileDistillery CI self-test, data (c) OpenStreetMap contributors, ODbL"
       worker_count: "3"
       region_scope: "europe/monaco"

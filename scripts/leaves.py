@@ -7,13 +7,13 @@ ordering".
 
 A leaf's region-id is its full path through the Geofabrik parent chain
 (e.g. "europe/germany/bavaria"), not Geofabrik's own short `id` field
-(e.g. "bavaria") — ids are unique on their own, but the path is what lets
+(e.g. "bavaria"): ids are unique on their own, but the path is what lets
 --region-scope filter a whole subtree by prefix (see in_scope), and is what
 `state/timings/<output_basename>.json` is keyed by, independent of
 Geofabrik's own URL/CDN structure (`pbf_url` alone doesn't preserve this:
 e.g. Geofabrik's own `north-america/us/wisconsin` URL path doesn't reflect
 the `effective_parent` correction that makes this leaf's id `us/wisconsin`,
-not `north-america/us/wisconsin` — see effective_parent below).
+not `north-america/us/wisconsin`; see effective_parent below).
 """
 
 import argparse
@@ -45,20 +45,20 @@ def fetch_index():
 #     top of the individual `us/<state>` extracts.
 #   - Geofabrik's own "Special Sub Regions" (alps, dach, ...): each
 #     continent's download page (e.g. download.geofabrik.de/europe.html)
-#     lists these separately under a "Special Sub Regions" heading —
-#     "outside of the usual administrative hierarchies and may duplicate
+#     lists these separately under a "Special Sub Regions" heading
+#     ("outside of the usual administrative hierarchies and may duplicate
 #     data already contained in the other sub regions", in Geofabrik's own
-#     words — but that grouping only exists in the HTML, not index-v1.json,
+#     words), but that grouping only exists in the HTML, not index-v1.json,
 #     so it's transcribed here by hand (checked against every continent
 #     page's `#specialsubregions` table).
 #   - "enfield" is a one-off third case, not either of the above: it's the
-#     *only* London borough Geofabrik publishes as its own leaf — every
+#     *only* London borough Geofabrik publishes as its own leaf. Every
 #     other borough (Camden, Westminster, Hackney, ...) is only available
 #     bundled in "greater-london" itself. `parent: "greater-london"` is
 #     correct, but it means the general "a referenced parent is coarser,
 #     drop it" rule below would silently exclude "greater-london" for
 #     having a child, without that one child covering anywhere near the
-#     whole area — the run would fetch tiny Enfield and quietly never
+#     whole area, so the run would fetch tiny Enfield and quietly never
 #     fetch the rest of London at all. See find_leaves() for the other
 #     half of this fix (a redundant leaf must not keep shadowing its own
 #     parent).
@@ -73,7 +73,7 @@ KNOWN_REDUNDANT_LEAVES = {
 def effective_parent(gid, by_id):
     """Geofabrik's `parent` field is supposed to encode the containment
     tree find_leaves() relies on, but for every `us/<state>` extract it
-    points straight at "north-america" instead of "us" — even though the
+    points straight at "north-america" instead of "us", even though the
     id itself already encodes that nesting with a literal "/". Trusting
     `parent` there makes "us" (whole country) look like a leaf alongside
     every state that's actually inside it, double-covering the whole US.
@@ -105,7 +105,7 @@ def compute_paths(features):
         parent = effective_parent(gid, by_id)
         # When the parent came from gid's own slash-prefix (see
         # effective_parent), gid already spells out that prefix itself
-        # (e.g. "us/wisconsin"'s effective parent is "us") — append only
+        # (e.g. "us/wisconsin"'s effective parent is "us"), so append only
         # the part after it, or the parent's path would be duplicated
         # into the result ("north-america/us/us/wisconsin").
         local = gid[len(parent) + 1:] if parent and gid.startswith(parent + "/") else gid
@@ -208,7 +208,7 @@ def build_manifest(region_scope, repo, token, state_branch, output_basename):
             })
 
     # Primary: known timing history sorts before size-only estimates (see
-    # docs/ARCHITECTURE.md "Timing history" — the two metrics are different
+    # docs/ARCHITECTURE.md "Timing history": the two metrics are different
     # units, sorting them as one numeric range would be meaningless).
     # Secondary, within each group: longest/largest first.
     regions.sort(key=lambda r: (not r["has_history"], -r["sort_metric"]))
@@ -224,19 +224,19 @@ def build_manifest(region_scope, repo, token, state_branch, output_basename):
 
 def write_queue(region_scope, repo, token, state_branch, output_basename, scope):
     """Builds this run's queue (see build_manifest) and seeds
-    state/queue/<scope>.json with it — `remaining` holds the full,
+    state/queue/<scope>.json with it: `remaining` holds the full,
     longest-first-sorted candidate list, `lock`/`done`/`failed` start empty.
     See docs/ARCHITECTURE.md "Locking": this *is* the queue from here on,
-    not a separate read-only artifact — claim.py pops entries off
+    not a separate read-only artifact, since claim.py pops entries off
     `remaining` directly.
 
     Unconditional overwrite (via update_json_file_with_retry, ignoring
     whatever content is already there) rather than a plain create: the prior
     run's cleanup_claims.py already reset this scope's file to `{}`, but
     didn't delete it, so a plain create-only write would 409 against that
-    leftover file. No concurrent writer to actually race here — the calling
+    leftover file. No concurrent writer to actually race here: the calling
     workflow's own `concurrency:` group already serializes overlapping runs
-    of the same scope — so this reuses update_json_file_with_retry purely
+    of the same scope, so this reuses update_json_file_with_retry purely
     for its "read current sha, then write" shape, not for conflict retry.
     """
     manifest = build_manifest(region_scope, repo, token, state_branch, output_basename)

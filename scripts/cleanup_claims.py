@@ -2,10 +2,10 @@
 """Resets this run's queue scope to empty on the calling repository's own
 `state` branch, run with `if: always()` at the end of `_pipeline.yml` so
 the next run of the same build starts clean (see docs/ARCHITECTURE.md
-"Locking" — the queue is deliberately not run-ID-scoped, so this is what
+"Locking": the queue is deliberately not run-ID-scoped, so this is what
 actually resets state between runs, and what `write_queue` overwrites at
 the start of the following run). One read (to log which regions ended
-permanently failed) plus one read-modify-write to clear it — down from the
+permanently failed) plus one read-modify-write to clear it, down from the
 old design's one listing plus one DELETE per ref, since every region's
 state now lives in a single shared file instead of its own ref. Best
 effort: a failure to reset is logged and left for a later cleanup run to

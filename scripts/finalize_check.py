@@ -3,11 +3,11 @@
 `state` branch. Prints one JSON object
 `{"done": [...], "failed": [...], "remaining": [...]}` (region ids) to
 stdout. `remaining` is what's neither done nor permanently failed (still in
-the queue's own `remaining` list, or still `lock`ed) — a non-empty
+the queue's own `remaining` list, or still `lock`ed). A non-empty
 `remaining` once the claim-loop round is finished means the run is
 incomplete (see docs/ARCHITECTURE.md "Merge"): either the queue never got
 claimed in time (a worker exiting cleanly on its own time budget, see
-"Worker job shape & the 6-hour limit" — no job ever fails for this case), a
+"Worker job shape & the 6-hour limit"; no job ever fails for this case), a
 worker crashed mid-build and left its claimed batch's lock entries stuck
 (see docs/ARCHITECTURE.md "Locking"), or a worker finished its regions but
 its outcome buffer never made it into `flush-timings` (see
