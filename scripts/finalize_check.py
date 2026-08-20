@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
-"""Reads the run's queue state directly from the calling repository's own
-`state` branch. Prints one JSON object
-`{"done": [...], "failed": [...], "remaining": [...]}` (region ids) to
-stdout. `remaining` is what's neither done nor permanently failed (still in
-the queue's own `remaining` list, or still `lock`ed). A non-empty
-`remaining` once the claim-loop round is finished means the run is
-incomplete (see docs/ARCHITECTURE.md "Merge"): either the queue never got
-claimed in time (a worker exiting cleanly on its own time budget, see
-"Worker job shape & the 6-hour limit"; no job ever fails for this case), a
-worker crashed mid-build and left its claimed batch's lock entries stuck
-(see docs/ARCHITECTURE.md "Locking"), or a worker finished its regions but
-its outcome buffer never made it into `flush-timings` (see
-cmd_flush_timings in claim.py). This is why `verify-complete` (the job that
-runs this) waits on `record-timings` (the job that runs `flush-timings`),
-not just on `build`.
+"""Reads the run's queue state from the calling repo's `state` branch.
+Prints `{"done": [...], "failed": [...], "remaining": [...]}` (region ids).
+`remaining` (still in the queue's own list, or still `lock`ed) being
+non-empty once the claim-loop round is finished means the run is
+incomplete (docs/ARCHITECTURE.md "Merge"): a worker exiting on its own time
+budget, a crash leaving `lock` entries stuck (see "Locking"), or a worker's
+outcome buffer never reaching `flush-timings`. That last case is why
+`verify-complete` (the job that runs this) waits on `record-timings`, not
+just `build`.
 
-With --fail-if-incomplete, exits non-zero (after printing the JSON) when
-`remaining` is non-empty, for use as the very last check before merging.
-"""
+With --fail-if-incomplete, exits non-zero when `remaining` is non-empty,
+for use as the last check before merging."""
 
 import argparse
 import json

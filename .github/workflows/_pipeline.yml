@@ -155,12 +155,9 @@ jobs:
           path: timings-buffer.jsonl
           if-no-files-found: ignore
 
-  # Single writer for both timing-history and claim-outcome recording for
-  # the whole run. See docs/ARCHITECTURE.md "Timing history & queue
-  # ordering". Runs unconditionally (`if: always()`) so one failed `build`
-  # leg doesn't cost every other leg's timing data or claim outcomes;
-  # verify-complete waits on this job, not just `build`, since it's the one
-  # that applies the claims half.
+  # Single writer for timing-history and claim-outcome recording; runs
+  # unconditionally so a failed `build` leg doesn't cost the others' data.
+  # See docs/ARCHITECTURE.md "Timing history & queue ordering".
   record-timings:
     needs: build
     if: always()
@@ -181,12 +178,9 @@ jobs:
 
       - run: pip install -r .tiledistillery/scripts/requirements.txt
 
-      # Deliberately no merge-multiple: every worker's buffer file shares
-      # the same filename (timings-buffer.jsonl), so flattening them into
-      # one directory would just overwrite each other. Without
-      # merge-multiple, download-artifact keeps each artifact in its own
-      # subdirectory named after it, which is all flush-timings needs since
-      # it searches --timings-dir recursively.
+      # No merge-multiple: every buffer shares the filename timings-buffer.jsonl,
+      # so flattening would overwrite them. Per-artifact subdirs are fine since
+      # flush-timings searches --timings-dir recursively.
       - name: Download every worker's timing buffer
         uses: actions/download-artifact@v4
         with:
@@ -194,7 +188,7 @@ jobs:
           path: timings
           if-no-artifact-found: ignore
 
-      - name: Merge into shared timing history (one write for the whole run)
+      - name: Merge into shared timing histor
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -203,20 +197,14 @@ jobs:
             --state-branch state --output-basename "${{ inputs.output_basename }}" \
             --timings-dir timings
 
-  # The hard gate: completeness is a property of *regions*, which are
-  # claimed once per call, not per output_basename (see docs/ARCHITECTURE.md
-  # "Locking"). Fails loudly rather than letting `merge` silently publish a
-  # world layer with holes in it (see docs/ARCHITECTURE.md "Merge"). `if:
-  # always()` so this still runs (and correctly reports/fails) even when one
-  # or more `build` matrix legs failed at the job level; every worker that
-  # did finish has already buffered its claims locally regardless of a
-  # sibling leg's own outcome. Needs `record-timings` too, not just `build`:
-  # that's the job that actually applies those buffered outcomes to the
-  # shared queue file (see its comment above); without waiting on it,
-  # every region would still read back as `remaining` here even on a
-  # perfectly healthy run.
+  # The hard gate: fails loudly instead of letting `merge` publish a world
+  # layer with holes (docs/ARCHITECTURE.md "Merge"). `if: always()` so a
+  # failed `build` leg doesn't skip this check. Needs `record-timings`, not
+  # just `build`: that's the job that actually applies buffered claims to
+  # the shared queue, so without it every region would still read back as
+  # `remaining`.
   verify-complete:
-    needs: [build, record-timings]
+    needs: build
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -244,14 +232,12 @@ jobs:
             --state-branch state --output-basename "${{ inputs.output_basename }}" \
             --fail-if-incomplete
 
-  # One flat merge per output_basename, deliberately not staged by
-  # continent. See docs/ARCHITECTURE.md "Merge". Each worker already
-  # wrote its shards as "<region>--<output_basename>.mbtiles" (see
-  # claim-and-build), so this only needs to glob for its own matrix cell's
-  # basename among every downloaded shard, shared across every layer built
-  # in this call.
+  # One flat merge per output_basename, deliberately not staged by continent
+  # (docs/ARCHITECTURE.md "Merge"). Shards are named
+  # "<region>--<output_basename>.mbtiles", so this just globs for its own
+  # matrix cell's basename among all downloaded shards.
   merge:
-    needs: [prepare, verify-complete]
+    needs: verify-complete
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -265,13 +251,10 @@ jobs:
           path: shards
           merge-multiple: true
 
-      # Cached so a healthy run's binary insulates every later run from the
-      # apt/Ubuntu-mirror flakiness below (seen hanging 20+ minutes against
-      # GitHub's default Azure mirror); cache is only ever consulted, never
-      # required, so a first-ever miss just pays the normal install cost.
-      # Key rotates monthly so cached binaries don't drift from upstream
-      # forever; restore-keys falls back to the newest prior month's cache
-      # on a miss instead of forcing a rebuild every month-boundary run.
+      # Insulates later runs from the apt/Ubuntu-mirror flakiness below
+      # (seen hanging 20+ minutes); consulted, never required, so a first
+      # miss just pays normal install cost. Key rotates monthly;
+      # restore-keys falls back to the newest prior month's cache on a miss.
       - name: Cache key date
         id: cache-date
         run: echo "date=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
@@ -285,10 +268,9 @@ jobs:
           restore-keys: |
             tippecanoe-bin-${{ runner.os }}-
 
-      # apt-get update has no built-in bound on a stalled mirror connection,
-      # so give it explicit per-request timeouts/retries and a step-level
-      # backstop: either lets it fail fast into the source-build fallback
-      # below instead of eating the whole job's runtime.
+      # apt-get has no built-in bound on a stalled mirror, so give it explicit
+      # timeouts/retries plus a step-level backstop, failing fast into the
+      # source-build fallback instead of eating the job's runtime.
       - name: Install tippecanoe
         if: steps.tippecanoe-cache.outputs.cache-hit != 'true'
         timeout-minutes: 10
@@ -331,15 +313,10 @@ jobs:
           name: ${{ matrix.basename }}-pmtiles
           path: ${{ matrix.basename }}.pmtiles
 
-  # Only actually needs verify-complete: that's the last job that reads
-  # queue state (finalize_check.py's completeness check), so it's the only
-  # thing cleanup must wait behind, and verify-complete itself already
-  # waits on record-timings (the job that writes queue state), so this
-  # transitively runs after that write too without needing to depend on it
-  # directly. merge never touches queue state at all (shards artifacts
-  # only), so gating cleanup on it too would just delay it for no reason.
-  # It runs as soon as verify-complete finishes, in parallel with merge
-  # instead of after it.
+  # Only needs verify-complete, transitively covering record-timings too
+  # (verify-complete already waits on it). merge never touches queue state,
+  # so gating cleanup on it as well would just delay it for no reason; this
+  # runs in parallel with merge instead.
   cleanup:
     needs: verify-complete
     if: always()

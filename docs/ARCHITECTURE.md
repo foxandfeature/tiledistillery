@@ -37,16 +37,30 @@ and a tiny one (Vatican) are both single, indivisible units of work (see
 "Timing history" for how that asymmetry is handled).
 
 `find_leaves()` also drops a hardcoded `KNOWN_REDUNDANT_LEAVES` set, for
-three distinct reasons `index-v1.json` gives no flag for. See the comment
+three distinct cases `index-v1.json` gives no flag for. See the comment
 above that set in `leaves.py` for the full reasoning and sources:
 
-- the US Census regions (declared parent `north-america` instead of `us`,
-  so nothing marks them as sitting on top of the individual `us/<state>`
-  extracts);
 - Geofabrik's own explicitly labeled "Special Sub Regions" (`dach`, `alps`,
-  ...), which would otherwise get claimed and built as a "leaf" in its own
-  right even though, e.g., `germany`, `austria`, and `switzerland` already
-  cover the same ground as `dach`;
+  the US Census regions, ...), which would otherwise get claimed and built
+  as a "leaf" in its own right even though, e.g., `germany`, `austria`,
+  and `switzerland` already cover the same ground as `dach`. Geofabrik
+  marks these itself, just not in `index-v1.json`: each continent's
+  download page (e.g. `download.geofabrik.de/europe.html`) lists them in a
+  `#specialsubregions` table ("outside of the usual administrative
+  hierarchies and may duplicate data already contained in the other sub
+  regions", in Geofabrik's own words), which is where
+  `KNOWN_REDUNDANT_LEAVES` is transcribed from by hand. Confirmed present
+  as of 2026-08-20 in: `europe.html` (`alps`, `britain-and-ireland`,
+  `dach`, `great-britain`), `north-america.html` (`us-midwest`,
+  `us-northeast`, `us-pacific`, `us-south`, `us-west`), `africa.html`
+  (`south-africa-and-lesotho`), `asia.html` (`sea`), `russia.html`
+  (`kaliningrad`); re-diff that table per continent page if Geofabrik
+  adds/removes a bundle;
+- `"us"`: every `us/<state>` extract declares `parent: "north-america"`
+  instead of `"us"` in `index-v1.json`, so nothing marks `"us"` itself as
+  already covered by its states; left in, `find_leaves()` would keep the
+  whole country as its own leaf alongside every individual state, building
+  the whole US twice over;
 - `enfield`, the one London borough Geofabrik happens to publish as its own
   extract while every other borough is only available inside
   `greater-london` itself. Left in, the general "a referenced parent is
@@ -54,6 +68,16 @@ above that set in `leaves.py` for the full reasoning and sources:
   and the run would fetch tiny Enfield while silently never fetching the
   rest of London at all. `find_leaves()` has to special-case this one the
   other way: a redundant leaf must not keep shadowing its own parent.
+
+A leaf's region-id (used everywhere below: `remaining`/`lock`/`done`/
+`failed` entries, `state/timings/<output_basename>.json`'s keys) is
+`compute_paths()`'s full path through Geofabrik's own declared parent
+chain (e.g. `europe/germany/bavaria`), not Geofabrik's own short `id`
+field (e.g. `bavaria`): ids are unique on their own, but only the path
+lets `--region-scope` filter a whole subtree by prefix (`in_scope`'s
+`path.startswith(region_scope + "/")`). `pbf_url` is kept as its own
+separate field per queue entry rather than derived from `id` (or vice
+versa), see "Locking".
 
 ## Distribution: dynamic claim queue, not a static matrix
 
@@ -177,15 +201,12 @@ nothing here does that anymore, so `scripts/common.py`'s
 `sanitize_ref_component` is unused for this purpose (it's still used for
 `ensure_branch`'s own ref handling, unrelated to the queue). Two fields
 travel with each `remaining` entry, not one, even though a region id alone
-would be a unique key: `pbf_url` isn't derivable from `id` (Geofabrik's own
-`urls.pbf` field is fetched from `index-v1.json`, not constructed (see
-`leaves.py`'s module docstring for a concrete counterexample: `us/wisconsin`
-corrects Geofabrik's `parent: north-america` via `effective_parent` so
-`--region-scope us` can prefix-match every state, but the *URL* path is
-still `north-america/us/wisconsin`, since Geofabrik's own site structure
-doesn't get that correction). Keeping `id` as the real key (not a URL
-fragment) is also what keeps `state/timings/<output_basename>.json`'s keys
-stable independent of Geofabrik's own URL/CDN choices.
+would be a unique key: `pbf_url` is kept alongside `id` rather than
+reconstructed from it, simpler and more robust than trusting `id`'s path
+structure to always map onto Geofabrik's URL layout. Keeping `id` as the
+real key (not a URL fragment) is also what keeps
+`state/timings/<output_basename>.json`'s keys stable independent of
+Geofabrik's own URL/CDN choices.
 
 The file *can* batch: claiming (`claim.py`'s `_next_region`) takes up to
 `--batch-size` (default 5) regions in a single `update_json_file_with_retry`
@@ -266,7 +287,11 @@ construction. This is also why `write_queue` can overwrite the scope's file
 unconditionally (via `update_json_file_with_retry`, but only for its
 "fetch current sha, then write" shape, not for genuine conflict retry):
 nothing else can be writing this scope concurrently, and the prior run's
-`cleanup` already reset whatever was there.
+`cleanup` already reset whatever was there. That prior reset leaves the
+file present but empty (`{}`), not deleted, so a plain create-only write
+would 409 against that leftover file; `update_json_file_with_retry`'s
+read-then-write shape avoids that without needing its retry behavior for
+anything real here.
 
 ## Timing history & queue ordering
 

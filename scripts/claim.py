@@ -133,18 +133,15 @@ def _record_done(args, region_id, duration_seconds):
 
 
 def cmd_flush_timings(args):
-    """Merges every worker's locally buffered outcomes (from repeated
-    _record_done/_record_failed calls) into the shared timing-history file
-    and the shared queue file's `done`/`failed` lists, one read-modify-write
-    each, called exactly once by a dedicated job downstream of `build` (see
-    `record-timings` in _pipeline.yml). See docs/ARCHITECTURE.md "Timing
-    history & queue ordering" for why this is a single writer, and why
-    failures here are wrapped, not raised.
+    """Merges every worker's buffered outcomes into the shared timing-history
+    file and the shared queue's `done`/`failed` lists, called once by
+    `record-timings` (_pipeline.yml). See docs/ARCHITECTURE.md "Timing
+    history & queue ordering" for the single-writer/wrapped-failures
+    rationale.
 
-    `timings_dir` is searched recursively for buffer files (each worker's
-    artifact lands in its own subdirectory after download-artifact, so
-    filenames don't need to be unique across workers). Missing or empty
-    directory means nothing was buffered: a no-op, not an error."""
+    `timings_dir` is searched recursively (each worker's artifact lands in
+    its own subdirectory); missing or empty means nothing was buffered, a
+    no-op."""
     entries = []
     if args.timings_dir and pathlib.Path(args.timings_dir).is_dir():
         for path in sorted(pathlib.Path(args.timings_dir).rglob("*")):
