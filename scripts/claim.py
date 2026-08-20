@@ -9,7 +9,7 @@ file directly.
 Subcommands:
 
     claim.py run-worker    --config ... --process ... --tilemaker-image ...
-    claim.py flush-timings --timings-dir DIR ...                      -> {"flushed": int}
+    claim.py flush-timings --timings-dir DIR ...
 
 `run-worker` is one worker's whole claim/download/build/report cycle,
 looping until the queue is empty; see cmd_run_worker's docstring. A region
@@ -19,8 +19,8 @@ flaky GitHub API call) happens before that point, on the same runner (see
 cmd_run_worker and common.py's `_request`), since retrying a genuinely
 broken region (bad Geofabrik data, a real 404, a build failing on
 tilemaker's own terms) from here would just waste other workers' time on
-the same failure. `flush-timings` prints one JSON object to stdout; see
-cmd_flush_timings's docstring.
+the same failure. `flush-timings` prints a one-line human-readable summary
+to stdout; see cmd_flush_timings's docstring.
 """
 
 import argparse
@@ -151,7 +151,7 @@ def cmd_flush_timings(args):
                 entries.extend(json.loads(line) for line in f if line.strip())
 
     if not entries:
-        print(json.dumps({"flushed": 0}))
+        print("nothing buffered, skipping flush")
         return
 
     done_entries = [e for e in entries if e.get("status") == "done"]
@@ -200,7 +200,7 @@ def cmd_flush_timings(args):
     except RuntimeError as exc:
         print(f"::warning::claims flush failed for {len(entries)} region(s): {exc}", file=sys.stderr)
 
-    print(json.dumps({"flushed": len(entries)}))
+    print(f"flushed {len(entries)} region outcome(s): {len(done_entries)} done, {len(failed_entries)} failed")
 
 
 def _record_failed(args, region_id, error):
@@ -226,6 +226,27 @@ def _download_pbf(url, dest):
     return subprocess.run(
         ["curl", "-fsSL", "--retry", "5", "--retry-connrefused", url, "-o", str(dest)]
     ).returncode
+
+
+# Fed through throttle_progress.sh (see that script for the \r-vs-\n
+# reasoning): tilemaker redraws progress in place for several different
+# counters, all \r-based, while genuine phase-transition messages use a
+# real newline. No --fire-immediately here: a region that builds inside
+# one interval, the common case, logs no progress lines at all.
+_TILEMAKER_PROGRESS_INTERVAL = "60"
+_THROTTLE_SCRIPT = str(pathlib.Path(__file__).parent / "throttle_progress.sh")
+
+
+def _run_docker_build(cmd):
+    """Runs a tilemaker `docker run` invocation, piping its combined
+    stdout/stderr through throttle_progress.sh. Returns docker's exit code
+    (not the throttle pipeline's, which only ever reformats output)."""
+    sys.stdout.flush()  # keep prior prints ordered before the pipeline's direct writes to the same fd
+    docker_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    throttle_proc = subprocess.Popen([_THROTTLE_SCRIPT, _TILEMAKER_PROGRESS_INTERVAL], stdin=docker_proc.stdout)
+    docker_proc.stdout.close()  # let docker_proc get SIGPIPE if throttle_proc exits early
+    throttle_proc.wait()
+    return docker_proc.wait()
 
 
 def cmd_run_worker(args):
@@ -265,7 +286,7 @@ def cmd_run_worker(args):
                 # only see paths under /data (see the docker run below).
                 store_dir = tempfile.mkdtemp(dir=".")
                 try:
-                    status = subprocess.run([
+                    status = _run_docker_build([
                         "docker", "run", "--rm",
                         "--user", f"{os.getuid()}:{os.getgid()}",
                         "-v", f"{os.environ['GITHUB_WORKSPACE']}:/data", "-w", "/data",
@@ -274,7 +295,7 @@ def cmd_run_worker(args):
                         "--output", str(shards_dir / f"{safe_name}--{basename}.mbtiles"),
                         "--config", config, "--process", process,
                         "--store", store_dir,
-                    ]).returncode
+                    ])
                 finally:
                     shutil.rmtree(store_dir, ignore_errors=True)
                 # Not retried, unlike the curl download above: see the

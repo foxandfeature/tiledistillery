@@ -244,6 +244,13 @@ jobs:
       matrix:
         basename: ${{ fromJson(needs.prepare.outputs.basenames) }}
     steps:
+      - name: Checkout tiledistillery
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tiledistillery
+
       - name: Download every worker's shards, every layer
         uses: actions/download-artifact@v4
         with:
@@ -287,6 +294,12 @@ jobs:
       - name: Add tippecanoe to PATH
         run: echo "$HOME/.cache/tippecanoe-bin" >> "$GITHUB_PATH"
 
+      # tile-join reports progress as a `z/x/y` line rewritten in place with
+      # \r, which would otherwise either flood the log with one line per
+      # batch or (GitHub Actions strips \r) collapse into one unreadable
+      # blob; throttled through scripts/throttle_progress.sh instead so at
+      # most one shows up per minute. Everything else (warnings, errors)
+      # passes through immediately.
       - name: Merge this layer's shards into its final file
         env:
           ATTRIBUTION: ${{ inputs.attribution }}
@@ -294,7 +307,8 @@ jobs:
         run: |
           tile-join --no-tile-size-limit \
             --attribution="$ATTRIBUTION" \
-            -o "${BASENAME}.pmtiles" shards/*--"${BASENAME}".mbtiles
+            -o "${BASENAME}.pmtiles" shards/*--"${BASENAME}".mbtiles 2>&1 \
+            | .tiledistillery/scripts/throttle_progress.sh 60
 
       - name: Summarize
         env:

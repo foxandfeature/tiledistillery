@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Reads the run's queue state from the calling repo's `state` branch.
-Prints `{"done": [...], "failed": [...], "remaining": [...]}` (region ids).
+"""Reads the run's queue state from the calling repo's `state` branch and
+prints a one-line summary of done/failed/remaining region counts.
 `remaining` (still in the queue's own list, or still `lock`ed) being
 non-empty once the claim-loop round is finished means the run is
 incomplete (docs/ARCHITECTURE.md "Merge"): a worker exiting on its own time
@@ -13,7 +13,6 @@ With --fail-if-incomplete, exits non-zero when `remaining` is non-empty,
 for use as the last check before merging."""
 
 import argparse
-import json
 import sys
 
 import claim
@@ -35,8 +34,7 @@ def main():
     failed = sorted(state.failed)
     remaining = sorted({r["id"] for r in state.remaining} | state.lock)
 
-    result = {"done": done, "failed": failed, "remaining": remaining}
-    print(json.dumps(result))
+    print(f"{len(done)} done, {len(failed)} failed, {len(remaining)} remaining")
 
     if failed:
         print(f"::warning::{len(failed)} region(s) permanently failed: {', '.join(failed)}", file=sys.stderr)
