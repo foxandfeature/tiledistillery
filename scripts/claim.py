@@ -276,6 +276,7 @@ def cmd_run_worker(args):
         safe_name = region_id.replace("/", "_")
 
         print(f"::group::{region_id}")
+        print(f"downloading {region['pbf_url']}")
         start = time.monotonic()
         status = _download_pbf(region["pbf_url"], pbf_path)
 
