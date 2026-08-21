@@ -1,39 +1,24 @@
 name: TileDistillery pipeline (reusable)
 
 # Builds one or more PMTiles layers from every Geofabrik leaf extract in
-# scope, using the caller's own tilemaker config/process files (see
-# docs/ARCHITECTURE.md). config/process/output_basename each take one
-# value, or a comma-separated list matched 1:1 (e.g. building "bins" and
-# "roads" together) — sharing one claim and one .osm.pbf download per
-# region across every config in the list, same fetch/build split
-# TileAlchemist uses for its own multi-profile runs.
+# scope, using the caller's own tilemaker config/process files. See
+# docs/ARCHITECTURE.md for the full design (region detection, distribution,
+# locking, timing history, multi-layer builds, merge). Deliberately does
+# NOT publish anywhere (no GitHub Release, no B2 upload); that's the
+# calling workflow's job.
 #
-# prepare -> build (single claim-loop matrix) -> record-timings (always,
-# single writer that both records the run's timing history and, since
-# every worker's done/failed outcome is only buffered locally until this
-# runs — see cmd_flush_timings in scripts/claim.py — releases every claimed
-# region's lock) -> verify-complete (hard gate) -> cleanup (always), with
-# merge (matrixed per output_basename) branching off verify-complete in
-# parallel. cleanup only waits on verify-complete (the last job that still
-# reads claim state), not on merge, since merge never touches it.
-# One round, not two, kept simple on purpose (see docs/ARCHITECTURE.md
-# "Distribution"): a worker crashing mid-region or hitting its own time
-# wall costs that one region, not a second dispatch — every other worker in
-# the same matrix keeps draining the queue regardless (`fail-fast: false`).
-# Deliberately does NOT publish anywhere (no GitHub Release, no B2 upload)
-# — that's the calling workflow's job, same separation as TileAlchemist's
-# _pipeline.yml.
+# Job graph: prepare -> build (single claim-loop matrix) -> record-timings
+# (always; single writer, also releases every claimed region's lock) ->
+# verify-complete (hard gate) -> cleanup (always), with merge (matrixed per
+# output_basename) branching off verify-complete in parallel. cleanup only
+# waits on verify-complete, not merge, since merge never touches claim state.
 #
-# State (queue/claim state + timing history) lives on the CALLING repo's own
-# `state` branch, never in this repo — see docs/ARCHITECTURE.md "State
+# State (queue/claim state + timing history) lives on the CALLING repo's
+# own `state` branch, never in this repo. See docs/ARCHITECTURE.md "State
 # lives in the caller's repo, not this one". The caller must grant
 # `permissions: contents: write`; this workflow's own `concurrency:` group
-# below (keyed by caller repo + output_basename) is what actually prevents
-# two overlapping runs of the same build from racing over the same claim
-# scope, so the caller does not need its own concurrency group for that.
-# Calling this pipeline for "bins,roads" together and calling it separately
-# for "bins" alone are different scopes/claim histories — see
-# docs/ARCHITECTURE.md "Locking".
+# below (keyed by caller repo + output_basename) is what prevents two
+# overlapping runs of the same build from racing over the same claim scope.
 
 on:
   workflow_call:
@@ -47,7 +32,7 @@ on:
         required: true
         type: string
       output_basename:
-        description: 'Base name(s) for each output .pmtiles file/artifact, matched 1:1 with config/process, e.g. "bins" or "bins,roads". Also the scope key for claims/timing history — see docs/ARCHITECTURE.md "Locking".'
+        description: 'Base name(s) for each output .pmtiles file/artifact, matched 1:1 with config/process, e.g. "bins" or "bins,roads". Also the scope key for claims/timing history. See docs/ARCHITECTURE.md "Locking".'
         required: true
         type: string
       attribution:
@@ -55,7 +40,7 @@ on:
         required: true
         type: string
       worker_count:
-        description: 'How many parallel claim-loop workers to fan out into (see docs/ARCHITECTURE.md "Distribution"). With one claim-loop round (no topup), fail-fast: false is what absorbs a worker crashing or timing out — every other worker keeps draining the same queue.'
+        description: 'How many parallel claim-loop workers to fan out into (see docs/ARCHITECTURE.md "Distribution"). With one claim-loop round (no topup), fail-fast: false is what absorbs a worker crashing or timing out, so every other worker keeps draining the same queue.'
         required: false
         type: string
         default: "20"
@@ -92,7 +77,7 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout tiledistillery (this pipeline's own scripts)
+      - name: Checkout tiledistillery
         uses: actions/checkout@v4
         with:
           repository: ${{ job.workflow_repository }}
@@ -105,12 +90,9 @@ jobs:
 
       - run: pip install -r .tiledistillery/scripts/requirements.txt
 
-      # Seeds state/queue/<scope>.json directly on the state branch — see
-      # docs/ARCHITECTURE.md "Locking": this *is* the queue every worker
-      # claims from below, not a separate read-only artifact, so there's no
-      # upload/download roundtrip to plumb through `build`/`verify-complete`
-      # anymore.
-      - name: Seed this run's queue
+      # Seeds state/queue/<scope>.json directly on the state branch. See
+      # docs/ARCHITECTURE.md "Locking".
+      - name: Seed queue
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -154,9 +136,8 @@ jobs:
           output_basename: ${{ inputs.output_basename }}
 
       # A worker's whole run can legitimately claim nothing (queue already
-      # empty when it started — see claim-and-build's own first-claim step,
-      # which skips the tilemaker image pull entirely in that case too), so
-      # a missing shard file here is expected, not a failure.
+      # empty when it started, see claim-and-build's own claim loop), so a
+      # missing shard file here is expected, not a failure.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -166,9 +147,7 @@ jobs:
 
       # Same "claimed nothing, so no file was ever written" caveat as
       # shards above. See docs/ARCHITECTURE.md "Timing history & queue
-      # ordering" and claim-and-build/action.yml: this worker never writes
-      # the shared timing-history file itself, only this local buffer —
-      # `record-timings` below is the one job that does.
+      # ordering".
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -176,22 +155,9 @@ jobs:
           path: timings-buffer.jsonl
           if-no-files-found: ignore
 
-  # Centralizes timing-history *and* claim-outcome recording into a single
-  # writer for the whole run, instead of every worker (or even every worker
-  # once) writing the shared state/timings/<output_basename>.json or
-  # state/queue/<scope>.json itself — see docs/ARCHITECTURE.md "Timing
-  # history & queue ordering" and cmd_done/cmd_flush_timings in
-  # scripts/claim.py for why per-writer contention on those files was a
-  # real problem, not just a theoretical one. The timing-history half is
-  # still independent of verify-complete (it only feeds *future* runs'
-  # queue ordering, never this run's correctness) and runs unconditionally
-  # so a run that ultimately fails verify-complete still keeps whatever
-  # timing data it produced — but the claims half is what actually applies
-  # every worker's buffered done/failed outcomes to the shared queue file
-  # (see cmd_flush_timings's docstring), so verify-complete now waits on
-  # this job too, not just on `build`. `if: always()` also means one failed
-  # `build` matrix leg doesn't cost every other, healthy leg's timing data
-  # or claim outcomes.
+  # Single writer for timing-history and claim-outcome recording; runs
+  # unconditionally so a failed `build` leg doesn't cost the others' data.
+  # See docs/ARCHITECTURE.md "Timing history & queue ordering".
   record-timings:
     needs: build
     if: always()
@@ -212,12 +178,9 @@ jobs:
 
       - run: pip install -r .tiledistillery/scripts/requirements.txt
 
-      # Deliberately no merge-multiple: every worker's buffer file shares
-      # the same filename (timings-buffer.jsonl), so flattening them into
-      # one directory would just overwrite each other. Without
-      # merge-multiple, download-artifact keeps each artifact in its own
-      # subdirectory named after it, which is all flush-timings needs since
-      # it searches --timings-dir recursively.
+      # No merge-multiple: every buffer shares the filename timings-buffer.jsonl,
+      # so flattening would overwrite them. Per-artifact subdirs are fine since
+      # flush-timings searches --timings-dir recursively.
       - name: Download every worker's timing buffer
         uses: actions/download-artifact@v4
         with:
@@ -225,7 +188,7 @@ jobs:
           path: timings
           if-no-artifact-found: ignore
 
-      - name: Merge into shared timing history (one write for the whole run)
+      - name: Merge into shared timing histor
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -234,20 +197,14 @@ jobs:
             --state-branch state --output-basename "${{ inputs.output_basename }}" \
             --timings-dir timings
 
-  # The hard gate — completeness is a property of *regions*, which are
-  # claimed once per call, not per output_basename (see docs/ARCHITECTURE.md
-  # "Locking"). Fails loudly rather than letting `merge` silently publish a
-  # world layer with holes in it (see docs/ARCHITECTURE.md "Merge"). `if:
-  # always()` so this still runs (and correctly reports/fails) even when one
-  # or more `build` matrix legs failed at the job level — every worker that
-  # did finish has already buffered its claims locally regardless of a
-  # sibling leg's own outcome. Needs `record-timings` too, not just `build`:
-  # that's the job that actually applies those buffered outcomes to the
-  # shared queue file (see its comment above) — without waiting on it,
-  # every region would still read back as `remaining` here even on a
-  # perfectly healthy run.
+  # The hard gate: fails loudly instead of letting `merge` publish a world
+  # layer with holes (docs/ARCHITECTURE.md "Merge"). `if: always()` so a
+  # failed `build` leg doesn't skip this check. Needs `record-timings`, not
+  # just `build`: that's the job that actually applies buffered claims to
+  # the shared queue, so without it every region would still read back as
+  # `remaining`.
   verify-complete:
-    needs: [build, record-timings]
+    needs: build
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -275,20 +232,25 @@ jobs:
             --state-branch state --output-basename "${{ inputs.output_basename }}" \
             --fail-if-incomplete
 
-  # One flat merge per output_basename, deliberately not staged by
-  # continent — see docs/ARCHITECTURE.md "Merge". Each worker already
-  # wrote its shards as "<region>--<output_basename>.mbtiles" (see
-  # claim-and-build), so this only needs to glob for its own matrix cell's
-  # basename among every downloaded shard, shared across every layer built
-  # in this call.
+  # One flat merge per output_basename, deliberately not staged by continent
+  # (docs/ARCHITECTURE.md "Merge"). Shards are named
+  # "<region>--<output_basename>.mbtiles", so this just globs for its own
+  # matrix cell's basename among all downloaded shards.
   merge:
-    needs: [prepare, verify-complete]
+    needs: verify-complete
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         basename: ${{ fromJson(needs.prepare.outputs.basenames) }}
     steps:
+      - name: Checkout tiledistillery
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tiledistillery
+
       - name: Download every worker's shards, every layer
         uses: actions/download-artifact@v4
         with:
@@ -296,13 +258,10 @@ jobs:
           path: shards
           merge-multiple: true
 
-      # Cached so a healthy run's binary insulates every later run from the
-      # apt/Ubuntu-mirror flakiness below (seen hanging 20+ minutes against
-      # GitHub's default Azure mirror) — cache is only ever consulted, never
-      # required, so a first-ever miss just pays the normal install cost.
-      # Key rotates monthly so cached binaries don't drift from upstream
-      # forever; restore-keys falls back to the newest prior month's cache
-      # on a miss instead of forcing a rebuild every month-boundary run.
+      # Insulates later runs from the apt/Ubuntu-mirror flakiness below
+      # (seen hanging 20+ minutes); consulted, never required, so a first
+      # miss just pays normal install cost. Key rotates monthly;
+      # restore-keys falls back to the newest prior month's cache on a miss.
       - name: Cache key date
         id: cache-date
         run: echo "date=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
@@ -316,10 +275,9 @@ jobs:
           restore-keys: |
             tippecanoe-bin-${{ runner.os }}-
 
-      # apt-get update has no built-in bound on a stalled mirror connection,
-      # so give it explicit per-request timeouts/retries and a step-level
-      # backstop — either lets it fail fast into the source-build fallback
-      # below instead of eating the whole job's runtime.
+      # apt-get has no built-in bound on a stalled mirror, so give it explicit
+      # timeouts/retries plus a step-level backstop, failing fast into the
+      # source-build fallback instead of eating the job's runtime.
       - name: Install tippecanoe
         if: steps.tippecanoe-cache.outputs.cache-hit != 'true'
         timeout-minutes: 10
@@ -336,6 +294,12 @@ jobs:
       - name: Add tippecanoe to PATH
         run: echo "$HOME/.cache/tippecanoe-bin" >> "$GITHUB_PATH"
 
+      # tile-join reports progress as a `z/x/y` line rewritten in place with
+      # \r, which would otherwise either flood the log with one line per
+      # batch or (GitHub Actions strips \r) collapse into one unreadable
+      # blob; throttled through scripts/throttle_progress.sh instead so at
+      # most one shows up per minute. Everything else (warnings, errors)
+      # passes through immediately.
       - name: Merge this layer's shards into its final file
         env:
           ATTRIBUTION: ${{ inputs.attribution }}
@@ -343,7 +307,8 @@ jobs:
         run: |
           tile-join --no-tile-size-limit \
             --attribution="$ATTRIBUTION" \
-            -o "${BASENAME}.pmtiles" shards/*--"${BASENAME}".mbtiles
+            -o "${BASENAME}.pmtiles" shards/*--"${BASENAME}".mbtiles 2>&1 \
+            | .tiledistillery/scripts/throttle_progress.sh 60
 
       - name: Summarize
         env:
@@ -362,15 +327,10 @@ jobs:
           name: ${{ matrix.basename }}-pmtiles
           path: ${{ matrix.basename }}.pmtiles
 
-  # Only actually needs verify-complete: that's the last job that reads
-  # queue state (finalize_check.py's completeness check), so it's the only
-  # thing cleanup must wait behind — and verify-complete itself already
-  # waits on record-timings (the job that writes queue state), so this
-  # transitively runs after that write too without needing to depend on it
-  # directly. merge never touches queue state at all (shards artifacts
-  # only), so gating cleanup on it too would just delay it for no reason —
-  # it runs as soon as verify-complete finishes, in parallel with merge
-  # instead of after it.
+  # Only needs verify-complete, transitively covering record-timings too
+  # (verify-complete already waits on it). merge never touches queue state,
+  # so gating cleanup on it as well would just delay it for no reason; this
+  # runs in parallel with merge instead.
   cleanup:
     needs: verify-complete
     if: always()

@@ -2,10 +2,10 @@
 
 Everything here talks to the *calling* repository's own GitHub API (repo +
 token are always passed in explicitly, read from GITHUB_REPOSITORY /
-GITHUB_TOKEN by each script's CLI) — never a third-party service. See
+GITHUB_TOKEN by each script's CLI), never a third-party service. See
 docs/ARCHITECTURE.md "Locking" and "Timing history" for why claims and
 timing history both go through the Contents API's read-modify-write (with
-retry-on-conflict) rather than one API call per region — request volume,
+retry-on-conflict) rather than one API call per region: request volume,
 not per-write atomicity, is what a full worker fan-out actually blows a
 budget on.
 """
@@ -25,7 +25,7 @@ _API_VERSION = "2022-11-28"
 
 # GitHub's secondary rate limits ask for backoff, not an immediate retry; a
 # full worker fleet (worker_count workers, no topup round to spread the load
-# across anymore — see _pipeline.yml) hammering the same repo's API at once
+# across anymore, see _pipeline.yml) hammering the same repo's API at once
 # can plausibly hit this, worst-case near the tail of a run when most
 # regions are already done and most workers are simultaneously racing over
 # the few still left. Doubling from a 4s base (this is the GitHub API being
@@ -36,14 +36,14 @@ _BACKOFF_BASE_S = 4
 _BACKOFF_CAP_S = 60
 
 # Every current caller of _request is single-threaded (no more thread pool
-# hammering this concurrently within one process — the claims locking that
+# hammering this concurrently within one process: the claims locking that
 # used to need one, refs' bulk delete, is gone; see docs/ARCHITECTURE.md
 # "Locking"), so this gate's cross-thread coordination is dormant today, not
 # load-bearing. Kept rather than removed: it's a no-op overhead-wise for a
 # single thread (one lock check, no contention), and if `_request` ever
 # gains another concurrent caller, this is exactly the mechanism that keeps
 # a 403/429 hit by one thread from leaving every other thread to burn its
-# own retry budget in lockstep and still 403 at the end — see the shared
+# own retry budget in lockstep and still 403 at the end. See the shared
 # vs. per-thread backoff reasoning this was originally built for.
 _rate_limit_lock = threading.Lock()
 _rate_limit_until = 0.0
@@ -80,7 +80,7 @@ def _headers(token):
 
 
 class TokenPermissionError(RuntimeError):
-    """A 403 that isn't GitHub's secondary-rate-limit signal — the token
+    """A 403 that isn't GitHub's secondary-rate-limit signal: the token
     itself lacks the needed scope, so retrying only wastes _MAX_RETRIES
     rounds of backoff before failing anyway. Raised immediately instead."""
 
@@ -125,7 +125,7 @@ def _request(method, path, token, **kwargs):
         if resp.status_code in (403, 429) or resp.status_code >= 500:
             # GitHub's secondary-rate-limit responses often carry a
             # Retry-After (seconds) that's a more authoritative wait time
-            # than a blind guess — honor it (still tripping the *shared*
+            # than a blind guess, so honor it (still tripping the *shared*
             # gate, not just sleeping this thread, so the rest of the pool
             # actually goes quiet too), otherwise fall back to backoff.
             retry_after = resp.headers.get("Retry-After")
@@ -147,19 +147,19 @@ def _request(method, path, token, **kwargs):
         # also never actually cleared like a genuine secondary rate limit
         # should within _MAX_RETRIES attempts of backoff (up to
         # _BACKOFF_CAP_S each, ~5 minutes total). Three real causes look
-        # identical from here — the calling workflow lacking `permissions:
+        # identical from here: the calling workflow lacking `permissions:
         # contents: write`; a secondary rate limit/abuse-detection window
         # that outlasted this call's retry budget; or the token's *primary*
         # hourly quota being exhausted outright ("API rate limit exceeded
-        # for installation" — this one won't clear for up to an hour, so no
+        # for installation", which won't clear for up to an hour, so no
         # retry budget short of that will ever succeed; batching claims
         # (see docs/ARCHITECTURE.md "Locking") is what keeps total request
-        # volume from getting anywhere near that quota in the first place)
-        # — so the message below says so rather than guessing. Either way
+        # volume from getting anywhere near that quota in the first place),
+        # so the message below says so rather than guessing. Either way
         # this needs to surface loudly: falling through to a bare
         # resp.raise_for_status() would produce an opaque "403 Client Error:
         # Forbidden" that callers' `except requests.RequestException` (meant
-        # for transient 5xx/network trouble — see cmd_next et al.) would
+        # for transient 5xx/network trouble, see _next_region et al.) would
         # silently swallow, masking any of the three as a passing blip.
         message = _permission_denied_message(resp) or resp.text[:200]
         raise TokenPermissionError(
@@ -169,8 +169,8 @@ def _request(method, path, token, **kwargs):
             "docs/ARCHITECTURE.md 'State lives in the caller's repo, not "
             "this one'), or this is a secondary rate limit/abuse-detection "
             "window, or the primary hourly quota ('API rate limit exceeded "
-            "for installation' — doesn't clear for up to an hour, so retrying "
-            "now won't help), that outlasted this call's retry budget — check "
+            "for installation', doesn't clear for up to an hour, so retrying "
+            "now won't help), that outlasted this call's retry budget. Check "
             "whether other calls in the same run succeeded before assuming "
             "the former."
         )
@@ -201,7 +201,7 @@ def get_ref_sha(repo, token, ref):
 
 def create_ref(repo, token, ref, sha):
     """ref: without the leading 'refs/'. Returns True if created, False if it
-    already existed (422) — the atomic compare-and-swap this whole locking
+    already existed (422): the atomic compare-and-swap this whole locking
     scheme relies on. Raises on any other error."""
     resp = _request(
         "POST",
@@ -265,11 +265,11 @@ def get_json_file(repo, token, branch, path):
 def put_json_file(repo, token, branch, path, content_dict, sha, message):
     """Returns True on success. Returns False on a 409/422 conflict (branch
     moved since `sha` was read) so the caller can re-fetch, re-merge the
-    mutation, and retry — see update_json_file_with_retry. Also False on a
+    mutation, and retry. See update_json_file_with_retry. Also False on a
     403 that reaches this point: _request already raises TokenPermissionError
     immediately for a genuine permission-denied 403, so a 403 surviving to
     here can only be the ambiguous/rate-limit-shaped kind that exhausted
-    _request's own retries — worth another read-modify-write cycle (with
+    _request's own retries: worth another read-modify-write cycle (with
     update_json_file_with_retry's own backoff) rather than a hard crash."""
     quoted = urllib.parse.quote(path)
     payload = {

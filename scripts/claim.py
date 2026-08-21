@@ -1,72 +1,37 @@
 #!/usr/bin/env python3
 """Claim lifecycle over one shared JSON queue file, against the calling
-repository's own `state` branch. See docs/ARCHITECTURE.md "Locking":
-`state/queue/<scope>.json` (written by leaves.py's write_queue at the start
-of the run) *is* the queue — one `remaining` list (the longest-first-sorted
-candidates, each `{id, pbf_url}`) plus three region-id lists — `lock`,
-`done`, `failed` — read and written through `common.update_json_file_with_retry`,
-the same read-modify-write-with-retry-on-conflict primitive `timings.json`
-already used (this replaced an earlier one-git-ref-per-region design, and
-then a separate read-only manifest artifact plus a claims-only version of
-this file; see ARCHITECTURE.md for why each of those stopped being the
-right shape).
+repository's own `state` branch (`state/queue/<scope>.json`, seeded by
+leaves.py's write_queue). See docs/ARCHITECTURE.md "Locking" for the file's
+shape, why claiming happens in small batches (`--batch-size`), and why
+`done`/`failed` buffer outcomes locally instead of touching the shared
+file directly.
 
-`next` claims a small *batch* of regions (`--batch-size`, default 5) in one
-read-modify-write instead of one API round-trip per region, caching the
-rest locally (`--batch-cache`) so a worker only touches the shared file
-once every `--batch-size` regions. This is the actual fix for the request
-volume that was exhausting the calling workflow's hourly GitHub API quota:
-a full-fan-out run over hundreds of regions was making thousands of calls
-(a fresh listing plus a ref create/delete per region, times every worker) —
-comfortably over budget regardless of how well-tuned the retry/backoff was,
-since a *primary* quota exhaustion (GitHub's "API rate limit exceeded for
-installation") doesn't clear for up to an hour, unlike the secondary/abuse
-limit short backoff is meant for.
+Subcommands:
 
-A locked region is never reclaimed within the same run — same accepted
-tradeoff the old designs made (see docs/ARCHITECTURE.md "Locking"): a
-crashed worker strands up to `--batch-size` regions instead of just one,
-which is the one real cost of batching, kept small by keeping the batch
-size small. `cleanup_claims.py` wipes the whole scope's state at the end of
-every run regardless of how it went, so this can't accumulate across runs.
+    claim.py run-worker    --config ... --process ... --tilemaker-image ...
+    claim.py flush-timings --timings-dir DIR ...
 
-Subcommands, each printing one JSON object to stdout:
-
-    claim.py next          --batch-cache FILE ...                    -> {"claimed": bool, "region": {...}|null}
-    claim.py done          --region-id X --duration-seconds N ...
-    claim.py failed        --region-id X [--error MSG] ...           -> {"permanently_failed": true}
-    claim.py flush-timings --timings-dir DIR ...                     -> {"flushed": int}
-
-`failed` is a single strike, not a retry counter: a region either finishes
-via `done` or is marked permanently `failed` the first time
-`claim-and-build` calls this after a build fails. Retrying transient
-failures (a flaky download, a flaky GitHub API call) is the caller's job,
-on the same runner, *before* it ever calls `failed` — see the retry
-flags/loops on `claim-and-build`'s own `curl` step and `common.py`'s
-`_request` — since retrying a genuinely broken region (bad Geofabrik data,
-a real 404, or a build that fails on tilemaker's own terms) from here would
-just waste other workers' time on the same failure. Deliberately not
-retried here: a `docker run tilemaker` failure. Unlike a download or a
-GitHub API call, there's no *server* on the other end of it that could be
-transiently down — this runner is the only thing running it — so a nonzero
-exit is tilemaker's own verdict on this region's data, not a blip worth
-retrying.
-
-`done` and `failed` don't touch the shared queue file at all: both append
-an outcome line to `--timings-buffer` locally (same buffer file `done`
-always used for durations — it now carries a `status` per line, not just a
-duration). `flush-timings` is run once, by a single dedicated job, against
-every worker's uploaded buffer (see _pipeline.yml's `record-timings` job) —
-one writer, one write, for both the timing-history file and the shared
-queue file's `done`/`failed` lists. See cmd_done's docstring for why
-per-worker/per-region writes from inside the claim loop are the thing being
-avoided.
+`run-worker` is one worker's whole claim/download/build/report cycle,
+looping until the queue is empty; see cmd_run_worker's docstring. A region
+is marked permanently `failed` (a single strike, not a retry counter) the
+first time a build fails: retrying transient failures (a flaky download, a
+flaky GitHub API call) happens before that point, on the same runner (see
+cmd_run_worker and common.py's `_request`), since retrying a genuinely
+broken region (bad Geofabrik data, a real 404, a build failing on
+tilemaker's own terms) from here would just waste other workers' time on
+the same failure. `flush-timings` prints a one-line human-readable summary
+to stdout; see cmd_flush_timings's docstring.
 """
 
 import argparse
 import json
+import os
 import pathlib
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 
 import requests
 
@@ -81,26 +46,9 @@ def scope_prefix(output_basename):
 class ClaimState:
     """Parsed view of one scope's queue file (`{"remaining": [{"id":...,
     "pbf_url":...}, ...], "lock": [...], "done": [...], "failed": [...]}`,
-    the last three each a list of region ids).
-
-    `lock` is the actual mutex: a region id only ever enters it once, via
-    the compare-and-swap `_claim_batch` does inside
-    `update_json_file_with_retry`'s retry-on-conflict loop, so two workers
-    racing the same read-modify-write can't both pop the same entry off
-    `remaining` (whichever write lands second re-reads the first one's
-    already-shrunk `remaining` and picks different candidates). There is no
-    lease/timestamp and no staleness sweep: a lock is only ever released by
-    `flush-timings` moving the id into `done`/`failed` once the worker that
-    claimed it reports back. A worker that never gets there (crashed,
-    OOM-killed, hit the job time limit) leaves its claimed batch's remaining
-    region(s) stuck for the rest of this run — the same tradeoff the earlier
-    designs made, just with a blast radius of `--batch-size` regions instead
-    of one; `cleanup_claims.py` wipes everything at the end of every run
-    regardless of how it went, so this can't accumulate across runs.
-    `worker_count` (see docs/ARCHITECTURE.md "Distribution") is the
-    mitigation: enough workers fanned out into one round means one stuck
-    batch costs a handful of regions, not the run, and every other worker
-    keeps draining the queue regardless.
+    the last three each a list of region ids). `lock` is the mutex; see
+    docs/ARCHITECTURE.md "Locking" for why it has no lease/timestamp or
+    staleness sweep, and what a crashed worker costs as a result.
     """
 
     def __init__(self, content):
@@ -118,39 +66,15 @@ def load_state(repo, token, state_branch, scope):
     return ClaimState(content)
 
 
-# Small on purpose: this bounds how many regions one crashed/OOM-killed/
-# timed-out worker can strand for the rest of a run (see ClaimState's
-# docstring) while still cutting the shared-file round trips claiming
-# "hundreds of leaves" (docs/ARCHITECTURE.md "Distribution") makes by
-# roughly this factor — 5 regions per read-modify-write instead of one full
-# ref listing plus a create per region is already most of the win; going
-# much bigger buys little further request-volume reduction against a much
-# worse crash blast radius.
+# Small on purpose: bounds the crash blast radius (see ClaimState's
+# docstring). See docs/ARCHITECTURE.md "Locking" for the full tradeoff.
 _DEFAULT_BATCH_SIZE = 5
 
 
-def _load_batch_cache(path):
-    p = pathlib.Path(path)
-    if not p.exists():
-        return []
-    with open(p) as f:
-        return json.load(f)
-
-
-def _save_batch_cache(path, regions):
-    with open(path, "w") as f:
-        json.dump(regions, f)
-
-
 def _claim_batch(repo, token, state_branch, scope, batch_size):
-    """One read-modify-write claims up to `batch_size` regions at once —
-    see the module docstring for why this, not one round trip per region,
-    is the actual fix for the request volume that was exhausting the
-    calling workflow's hourly GitHub API quota. `update_json_file_with_retry`
-    already retries the whole read-modify-write on a conflicting concurrent
-    write from another worker, re-picking a fresh batch against the
-    re-read state each attempt, so two workers racing this can't end up
-    with an overlapping batch."""
+    """One read-modify-write claims up to `batch_size` regions at once. See
+    docs/ARCHITECTURE.md "Locking" for why batching, and why retry-on-conflict
+    here can't produce an overlapping batch."""
     claimed = []
 
     def mutate(content):
@@ -171,95 +95,53 @@ def _claim_batch(repo, token, state_branch, scope, batch_size):
     return claimed
 
 
-def cmd_next(args):
-    batch = _load_batch_cache(args.batch_cache)
+def _next_region(args, batch):
+    """One region popped from `batch` (an in-memory list, refilled in place
+    from the shared queue via _claim_batch once empty), or None once the
+    shared queue is exhausted. Used by cmd_run_worker, whose loop owns
+    `batch` for its own lifetime, so a fresh claim is only ever one shared-
+    file read-modify-write per `--batch-size` regions, not one per call."""
     if not batch:
-        # ensure_branch is itself an API call (a GET, plus a POST the very
-        # first time ever) — only paid when the cache is actually empty and
-        # a real batch claim is about to happen, not on every cache-served
-        # call, or it would silently undo most of batching's point.
         common.ensure_branch(args.repo, args.token, args.state_branch)
         scope = scope_prefix(args.output_basename)
         try:
-            batch = _claim_batch(args.repo, args.token, args.state_branch, scope, args.batch_size)
+            batch.extend(_claim_batch(args.repo, args.token, args.state_branch, scope, args.batch_size))
         except common.TokenPermissionError:
             raise
         except (requests.RequestException, RuntimeError) as exc:
-            # A persistent GitHub outage (5xx/network trouble surviving
-            # common._request's own retries, or update_json_file_with_retry
-            # giving up after its own retry-on-conflict attempts) shouldn't
-            # crash this worker — nothing was claimed here, so report the
-            # same as an empty queue, the same "log and continue" treatment
-            # cmd_done/cmd_failed give this class of failure.
+            # Reached only after the retries inside _request/
+            # update_json_file_with_retry are already exhausted: a
+            # persistent outage shouldn't crash this worker, so treat it
+            # like an empty queue instead, same as cmd_flush_timings does.
             print(f"::warning::claim batch for {args.output_basename} failed: {exc}", file=sys.stderr)
-            batch = []
 
     if not batch:
-        _save_batch_cache(args.batch_cache, [])
-        print(json.dumps({"claimed": False, "region": None}))
-        return
+        return None
 
-    region = batch.pop(0)
-    _save_batch_cache(args.batch_cache, batch)
-    print(json.dumps({"claimed": True, "region": region}))
+    return batch.pop(0)
 
 
-def cmd_done(args):
-    # No API call at all: outcome goes to a local, per-worker file, not
-    # straight to the shared queue file — a worker claims tens of regions
-    # in a row, and writing the shared file here on every single `done`
-    # would turn it into a hot lock (`worker_count` workers finishing
-    # regions close together all racing the same read-modify-write, which
-    # under a full fan-out can exhaust update_json_file_with_retry's
-    # attempts outright — see docs/ARCHITECTURE.md "Timing history & queue
-    # ordering" for why this exact pattern was already avoided for
-    # durations). Appending to a local file is a pure filesystem write — no
-    # network round trip, so it can't collide with anything. cmd_flush_timings
-    # merges every worker's buffer into the shared queue and timing-history
-    # files in one write each per run; see its docstring.
+def _record_done(args, region_id, duration_seconds):
+    # No API call: buffered locally, merged later by cmd_flush_timings. See
+    # docs/ARCHITECTURE.md "Locking" for why not straight to the shared file.
     with open(args.timings_buffer, "a") as f:
         f.write(json.dumps({
-            "region_id": args.region_id,
+            "region_id": region_id,
             "status": "done",
-            "duration_seconds": args.duration_seconds,
+            "duration_seconds": duration_seconds,
         }) + "\n")
-
-    print(json.dumps({"ok": True}))
 
 
 def cmd_flush_timings(args):
-    """Merges every worker's locally buffered outcomes (from repeated
-    cmd_done/cmd_failed calls, one JSON line each, uploaded as one artifact
-    per worker) into the shared timing-history file and the shared queue
-    file's `done`/`failed` lists, one read-modify-write each, for the whole
-    run — called exactly once, by a dedicated job downstream of `build`
-    (see `record-timings` in _pipeline.yml). This is the actual fix for the
-    contention cmd_done's docstring describes: not a smaller worker-sized
-    batch racing other workers' batches, but a single writer, so there is
-    no concurrent writer left to race at all. It's also what finally
-    releases each region's `lock` entry (see ClaimState's docstring) —
-    unlike the old design, a region isn't durably done/failed until this
-    runs, so a worker that dies before its buffer artifact uploads loses
-    that outcome the same way it would lose an unuploaded shard file.
+    """Merges every worker's buffered outcomes into the shared timing-history
+    file and the shared queue's `done`/`failed` lists, called once by
+    `record-timings` (_pipeline.yml). See docs/ARCHITECTURE.md "Timing
+    history & queue ordering" for the single-writer/wrapped-failures
+    rationale.
 
-    `timings_dir` is searched recursively for buffer files (each worker's
-    artifact lands in its own subdirectory after download-artifact, so
-    filenames don't need to be unique across workers). Missing or empty
-    directory means nothing was buffered (e.g. a run that claimed zero
-    regions) — a no-op, not an error.
-
-    Still wrapped, not raised, on failure: this being a single write per
-    run makes update_json_file_with_retry's attempts being exhausted far
-    less likely than under per-region or per-worker writes, but GitHub API
-    trouble unrelated to write contention (an outage, a persistent 5xx)
-    is still possible. Losing this run's timing sample is fine — regions
-    with no recorded history just fall back to byte-size ordering (see
-    docs/ARCHITECTURE.md "Timing history & queue ordering"). Losing the
-    claims flush is not fine for this run's completeness (those regions
-    stay `remaining` and `finalize_check.py --fail-if-incomplete` fails the
-    run below), but is still not raised here — this job runs unconditionally
-    and independently of `verify-complete` precisely so one failed `build`
-    leg's timing data isn't lost over it; a warning is enough."""
+    `timings_dir` is searched recursively (each worker's artifact lands in
+    its own subdirectory); missing or empty means nothing was buffered, a
+    no-op."""
     entries = []
     if args.timings_dir and pathlib.Path(args.timings_dir).is_dir():
         for path in sorted(pathlib.Path(args.timings_dir).rglob("*")):
@@ -269,7 +151,7 @@ def cmd_flush_timings(args):
                 entries.extend(json.loads(line) for line in f if line.strip())
 
     if not entries:
-        print(json.dumps({"flushed": 0}))
+        print("nothing buffered, skipping flush")
         return
 
     done_entries = [e for e in entries if e.get("status") == "done"]
@@ -318,21 +200,119 @@ def cmd_flush_timings(args):
     except RuntimeError as exc:
         print(f"::warning::claims flush failed for {len(entries)} region(s): {exc}", file=sys.stderr)
 
-    print(json.dumps({"flushed": len(entries)}))
+    print(f"flushed {len(entries)} region outcome(s): {len(done_entries)} done, {len(failed_entries)} failed")
 
 
-def cmd_failed(args):
-    # See cmd_done's docstring: same "no API call, buffer locally" reasoning
+def _record_failed(args, region_id, error):
+    # See _record_done: same "no API call, buffer locally" reasoning
     # applies here.
     with open(args.timings_buffer, "a") as f:
         f.write(json.dumps({
-            "region_id": args.region_id,
+            "region_id": region_id,
             "status": "failed",
-            "error": args.error,
+            "error": error,
         }) + "\n")
-    if args.error:
-        print(f"::warning::{args.region_id} failed: {args.error}", file=sys.stderr)
-    print(json.dumps({"permanently_failed": True}))
+    if error:
+        print(f"::warning::{region_id} failed: {error}", file=sys.stderr)
+
+
+def _download_pbf(url, dest):
+    """Exit status of downloading `url` to `dest` via curl. `--retry` (no
+    `--retry-all-errors`) retries only transient failures (timeouts, 5xx,
+    408/429), not a 404/other 4xx: Geofabrik saying the region is genuinely
+    gone shouldn't cost 5 attempts before falling through to the caller's
+    `_record_failed`. No `--retry-delay`: curl's own default backoff is
+    already what we want here."""
+    return subprocess.run(
+        ["curl", "-fsSL", "--retry", "5", "--retry-connrefused", url, "-o", str(dest)]
+    ).returncode
+
+
+# Fed through throttle_progress.sh (see that script for the \r-vs-\n
+# reasoning): tilemaker redraws progress in place for several different
+# counters, all \r-based, while genuine phase-transition messages use a
+# real newline. No --fire-immediately here: a region that builds inside
+# one interval, the common case, logs no progress lines at all.
+_TILEMAKER_PROGRESS_INTERVAL = "60"
+_THROTTLE_SCRIPT = str(pathlib.Path(__file__).parent / "throttle_progress.sh")
+
+
+def _run_docker_build(cmd):
+    """Runs a tilemaker `docker run` invocation, piping its combined
+    stdout/stderr through throttle_progress.sh. Returns docker's exit code
+    (not the throttle pipeline's, which only ever reformats output)."""
+    sys.stdout.flush()  # keep prior prints ordered before the pipeline's direct writes to the same fd
+    docker_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    throttle_proc = subprocess.Popen([_THROTTLE_SCRIPT, _TILEMAKER_PROGRESS_INTERVAL], stdin=docker_proc.stdout)
+    docker_proc.stdout.close()  # let docker_proc get SIGPIPE if throttle_proc exits early
+    throttle_proc.wait()
+    return docker_proc.wait()
+
+
+def cmd_run_worker(args):
+    """One worker's claim/download/build/report loop, until the shared
+    queue is exhausted (`claim-and-build`'s composite action step). See
+    docs/ARCHITECTURE.md "Distribution" for why a worker loops over many
+    regions, and "Multiple layers, one download" for why one claimed region
+    builds every `--config`/`--process` pair against a single download and
+    is reported failed as one atomic unit if any of them fails.
+    """
+    configs = args.config.split(",")
+    processes = args.process.split(",")
+    basenames = args.output_basename.split(",")
+
+    shards_dir = pathlib.Path(args.shards_dir)
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    pbf_path = pathlib.Path("region.osm.pbf")
+    batch = []
+
+    while True:
+        region = _next_region(args, batch)
+        if region is None:
+            print("queue empty, worker exiting")
+            return
+
+        region_id = region["id"]
+        safe_name = region_id.replace("/", "_")
+
+        print(f"::group::{region_id}")
+        start = time.monotonic()
+        status = _download_pbf(region["pbf_url"], pbf_path)
+
+        if status == 0:
+            for config, process, basename in zip(configs, processes, basenames):
+                # Store dir must live under the bind-mounted workspace, not
+                # system /tmp (tempfile's default), since the container can
+                # only see paths under /data (see the docker run below).
+                store_dir = tempfile.mkdtemp(dir=".")
+                try:
+                    status = _run_docker_build([
+                        "docker", "run", "--rm",
+                        "--user", f"{os.getuid()}:{os.getgid()}",
+                        "-v", f"{os.environ['GITHUB_WORKSPACE']}:/data", "-w", "/data",
+                        args.tilemaker_image,
+                        "--input", str(pbf_path),
+                        "--output", str(shards_dir / f"{safe_name}--{basename}.mbtiles"),
+                        "--config", config, "--process", process,
+                        "--store", store_dir,
+                    ])
+                finally:
+                    shutil.rmtree(store_dir, ignore_errors=True)
+                # Not retried, unlike the curl download above: see the
+                # module docstring's "single strike" note.
+                if status != 0:
+                    break
+
+        pbf_path.unlink(missing_ok=True)
+        duration_seconds = int(time.monotonic() - start)
+        print("::endgroup::")
+
+        if status == 0:
+            _record_done(args, region_id, duration_seconds)
+        else:
+            for shard in shards_dir.glob(f"{safe_name}--*.mbtiles"):
+                shard.unlink()
+            _record_failed(args, region_id, f"build failed (exit {status})")
 
 
 def _add_common_args(p):
@@ -346,30 +326,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_next = sub.add_parser("next")
-    _add_common_args(p_next)
-    p_next.add_argument("--batch-size", type=int, default=_DEFAULT_BATCH_SIZE, help="Regions to claim per shared-file read-modify-write; see _DEFAULT_BATCH_SIZE.")
-    p_next.add_argument("--batch-cache", required=True, help="Local file this worker's still-unclaimed batch is cached in between calls, so only every Nth `next` call touches the API.")
-    p_next.set_defaults(func=cmd_next)
-
-    p_done = sub.add_parser("done")
-    _add_common_args(p_done)
-    p_done.add_argument("--region-id", required=True)
-    p_done.add_argument("--duration-seconds", type=int, required=True)
-    p_done.add_argument("--timings-buffer", required=True, help="Local file this worker's outcomes are appended to; see cmd_flush_timings.")
-    p_done.set_defaults(func=cmd_done)
-
-    p_failed = sub.add_parser("failed")
-    _add_common_args(p_failed)
-    p_failed.add_argument("--region-id", required=True)
-    p_failed.add_argument("--error", default="")
-    p_failed.add_argument("--timings-buffer", required=True, help="Local file this worker's outcomes are appended to; see cmd_flush_timings.")
-    p_failed.set_defaults(func=cmd_failed)
-
     p_flush = sub.add_parser("flush-timings")
     _add_common_args(p_flush)
     p_flush.add_argument("--timings-dir", required=True, help="Directory to search recursively for workers' uploaded timing-buffer files.")
     p_flush.set_defaults(func=cmd_flush_timings)
+
+    p_run = sub.add_parser("run-worker")
+    _add_common_args(p_run)
+    p_run.add_argument("--batch-size", type=int, default=_DEFAULT_BATCH_SIZE, help="See _DEFAULT_BATCH_SIZE.")
+    p_run.add_argument("--timings-buffer", required=True, help="Local file this worker's outcomes are appended to; see cmd_flush_timings.")
+    p_run.add_argument("--config", required=True, help="Comma-separated tilemaker JSON layer config path(s), matched 1:1 with --process/--output-basename.")
+    p_run.add_argument("--process", required=True, help="Comma-separated tilemaker Lua process script path(s), matched 1:1 with --config/--output-basename.")
+    p_run.add_argument("--shards-dir", default="shards", help="Where each region's <region-id>--<output_basename>.mbtiles shards are written.")
+    p_run.add_argument("--tilemaker-image", required=True, help="e.g. ghcr.io/systemed/tilemaker:master; see docs/ARCHITECTURE.md 'Tile-build engine: tilemaker'.")
+    p_run.set_defaults(func=cmd_run_worker)
 
     args = parser.parse_args()
     args.func(args)

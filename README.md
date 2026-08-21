@@ -3,7 +3,7 @@
 A reusable GitHub Actions pipeline that builds PMTiles vector-tile layers
 from raw [Geofabrik](https://download.geofabrik.de) OSM extracts, using
 [tilemaker](https://github.com/systemed/tilemaker). A sibling project to
-[TileAlchemist](https://github.com/foxandfeature/tilealchemist) — a related
+[TileAlchemist](https://github.com/foxandfeature/tilealchemist), a related
 problem, but architecturally independent; neither is input or output for
 the other.
 
@@ -32,12 +32,12 @@ jobs:
       config: tiles/config.json
       process: tiles/process.lua
       output_basename: my-layer
-      attribution: "My Layer — data (c) OpenStreetMap contributors, ODbL"
+      attribution: "My Layer, data (c) OpenStreetMap contributors, ODbL"
       # region_scope: "europe/germany"   # optional: restrict to a subtree instead of the whole world
       # worker_count: "20"               # optional: default 20
       #
       # Building more than one layer? Pass matching comma-separated lists
-      # instead — one shared .osm.pbf download per region across all of
+      # instead: one shared .osm.pbf download per region across all of
       # them (see docs/ARCHITECTURE.md "Multiple layers, one download"):
       #   config: tiles/bins/config.json,tiles/roads/config.json
       #   process: tiles/bins/process.lua,tiles/roads/process.lua
@@ -54,7 +54,7 @@ jobs:
       title: "My Layer"
 ```
 
-`_pipeline.yml` never publishes anywhere itself — pick a publish target
+`_pipeline.yml` never publishes anywhere itself. Pick a publish target
 (GitHub Releases, shown above, or your own Backblaze B2 job) in your own
 calling workflow. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 "Publishing" and "Consumer contract" for the full picture, including why
@@ -94,7 +94,7 @@ Bug reports and pull requests are welcome.
 
 ## License / attribution
 
-The code in this repository is licensed under the MIT License — see
+The code in this repository is licensed under the MIT License. See
 [`LICENSE`](LICENSE). Map data built *with* this pipeline (Geofabrik/OSM
 extracts and anything derived from them) is not: OpenStreetMap data is
 © OpenStreetMap contributors, available under the
