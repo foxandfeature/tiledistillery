@@ -237,7 +237,7 @@ jobs:
   # "<region>--<output_basename>.mbtiles", so this just globs for its own
   # matrix cell's basename among all downloaded shards.
   merge:
-    needs: verify-complete
+    needs: [prepare, verify-complete]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
