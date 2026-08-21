@@ -5,6 +5,11 @@
 # lines always print immediately. Splits purely on which byte terminated
 # a chunk, not on message text, so it works for any \r-redrawing tool.
 #
+# Particularly worth using ahead of a GitHub Actions log: its viewer
+# doesn't support \r as an in-place redraw, so a \r-heavy tool piped in
+# unthrottled either floods the log with one line per redraw or renders
+# as one unreadable blob, depending on the step.
+#
 # A pending \r line is dropped, not shown, once a real \n line arrives:
 # the \n line already proves the tool moved on, so the stale redraw
 # before it isn't worth another log line (flushing it anyway would leak
