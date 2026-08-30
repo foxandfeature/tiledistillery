@@ -567,10 +567,12 @@ number against.
   matched 1:1 with `config`/`process`.
 - `attribution`: required, one value applied to every layer in the call.
 - `worker_count`: default ~20 (see "Distribution").
-- `region_scope`: optional Geofabrik path prefix filter (e.g.
-  `europe/monaco`); default empty = every leaf, whole world. Exists so a
-  caller (including this repo's own CI, see below) can run the pipeline
-  against a tiny slice instead of triggering a full-world build every time.
+- `region_scope`: optional Geofabrik path prefix filter, or comma-separated
+  list of prefixes (e.g. `europe/monaco` or
+  `europe/monaco,europe/andorra`); default empty = every leaf, whole
+  world. Exists so a caller (including this repo's own CI, see below) can
+  run the pipeline against a tiny slice instead of triggering a full-world
+  build every time.
 
 Any repository calls it via
 `uses: foxandfeature/tiledistillery/.github/workflows/_pipeline.yml@<ref>`,
@@ -601,8 +603,11 @@ sharding, claiming, and merge work end to end, and specifically that the
 comma-separated `config`/`process`/`output_basename` path (see "Multiple
 layers, one download") produces two independent `<output_basename>.pmtiles`
 outputs from one shared download per region. Scoped via `region_scope` to
-something tiny (e.g. `europe/monaco`) so PR CI doesn't attempt a
-full-world build. The first real consumer, `trashtracker-tiles`, is a
+three tiny microstate leaves (`europe/monaco,europe/liechtenstein,europe/andorra`,
+one per `worker_count: 3` worker) so PR CI doesn't attempt a full-world
+build, and so the claim loop actually distributes real work across all
+three workers instead of two of them claiming nothing. The first real
+consumer, `trashtracker-tiles`, is a
 separate, later, out-of-scope repo.
 
 ## Deliberately deferred

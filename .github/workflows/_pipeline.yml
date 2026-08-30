@@ -45,7 +45,7 @@ on:
         type: string
         default: "20"
       region_scope:
-        description: 'Optional Geofabrik path prefix (e.g. "europe/monaco") to restrict the build to a subtree instead of the whole world.'
+        description: 'Optional Geofabrik path prefix, or comma-separated list of prefixes (e.g. "europe/monaco" or "europe/monaco,europe/andorra"), to restrict the build to one or more subtrees instead of the whole world.'
         required: false
         type: string
         default: ""

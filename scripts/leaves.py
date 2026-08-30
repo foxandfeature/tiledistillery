@@ -9,6 +9,10 @@ A leaf's region-id is its full path through Geofabrik's own declared
 parent chain (see compute_paths), not Geofabrik's own short `id` field;
 see docs/ARCHITECTURE.md "Region detection" for why (--region-scope
 prefix filtering, state/timings/ keys).
+
+--region-scope accepts a comma-separated list of prefixes (in_scope
+matches if any one of them matches), not just a single prefix, so a
+caller can restrict a run to several disjoint subtrees at once.
 """
 
 import argparse
@@ -92,7 +96,10 @@ def find_leaves(features):
 def in_scope(path, region_scope):
     if not region_scope:
         return True
-    return path == region_scope or path.startswith(region_scope + "/")
+    return any(
+        path == scope or path.startswith(scope + "/")
+        for scope in region_scope.split(",")
+    )
 
 
 def pbf_size(url):
@@ -197,7 +204,10 @@ def write_queue(region_scope, repo, token, state_branch, output_basename, scope)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--region-scope", default="")
+    parser.add_argument(
+        "--region-scope", default="",
+        help='Geofabrik path prefix, or comma-separated list of prefixes, to restrict the build to (e.g. "europe/monaco" or "europe/monaco,europe/andorra"). Empty means the whole world.',
+    )
     parser.add_argument("--repo", required=True, help="owner/repo of the calling repository (state lives on its own 'state' branch)")
     parser.add_argument("--token", required=True)
     parser.add_argument("--state-branch", default="state")
