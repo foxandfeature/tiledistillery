@@ -20,13 +20,7 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
-
-    - name: Install pipeline script dependencies
-      shell: bash
-      run: pip install -r .tiledistillery/scripts/requirements.txt
+    - uses: ./.tiledistillery/.github/actions/setup-pipeline-scripts
 
     - name: Pull tilemaker image
       shell: bash

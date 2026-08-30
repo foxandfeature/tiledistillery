@@ -84,11 +84,7 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .tiledistillery
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - run: pip install -r .tiledistillery/scripts/requirements.txt
+      - uses: ./.tiledistillery/.github/actions/setup-pipeline-scripts
 
       # Seeds state/queue/<scope>.json directly on the state branch. See
       # docs/ARCHITECTURE.md "Locking".
@@ -172,11 +168,7 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .tiledistillery
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - run: pip install -r .tiledistillery/scripts/requirements.txt
+      - uses: ./.tiledistillery/.github/actions/setup-pipeline-scripts
 
       # No merge-multiple: every buffer shares the filename timings-buffer.jsonl,
       # so flattening would overwrite them. Per-artifact subdirs are fine since
@@ -217,11 +209,7 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .tiledistillery
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - run: pip install -r .tiledistillery/scripts/requirements.txt
+      - uses: ./.tiledistillery/.github/actions/setup-pipeline-scripts
 
       - name: Confirm every region is done or permanently failed
         env:
@@ -345,11 +333,7 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .tiledistillery
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - run: pip install -r .tiledistillery/scripts/requirements.txt
+      - uses: ./.tiledistillery/.github/actions/setup-pipeline-scripts
 
       - name: Reset queue state for this run
         env:

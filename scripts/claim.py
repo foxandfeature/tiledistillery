@@ -216,34 +216,69 @@ def _record_failed(args, region_id, error):
         print(f"::warning::{region_id} failed: {error}", file=sys.stderr)
 
 
+# Fed through throttle_progress.sh (see that script for the \r-vs-\n
+# reasoning): both curl's own progress meter and tilemaker's several
+# per-tile/per-block counters redraw in place via \r, while genuine
+# phase-transition messages use a real newline.
+_THROTTLE_SCRIPT = str(pathlib.Path(__file__).parent / "throttle_progress.sh")
+# Regions run "several-hundred-MB" downloads (see docs/ARCHITECTURE.md
+# "Distribution"); shorter than the build interval below since a stalled
+# or slow transfer is worth surfacing sooner than a build phase is.
+_DOWNLOAD_PROGRESS_INTERVAL = "15"
+_TILEMAKER_PROGRESS_INTERVAL = "60"
+
+
 def _download_pbf(url, dest):
-    """Exit status of downloading `url` to `dest` via curl. `--retry` (no
+    """Exit status of downloading `url` to `dest` via curl, piping curl's
+    own stderr progress meter (% complete, size, transfer speed, estimated
+    time left) through throttle_progress.sh so the GitHub Actions log gets
+    periodic single-line updates instead of either silence (the prior
+    `-s`) or an unreadable flood of \r redraws. `--retry` (no
     `--retry-all-errors`) retries only transient failures (timeouts, 5xx,
     408/429), not a 404/other 4xx: Geofabrik saying the region is genuinely
     gone shouldn't cost 5 attempts before falling through to the caller's
     `_record_failed`. No `--retry-delay`: curl's own default backoff is
-    already what we want here."""
-    return subprocess.run(
-        ["curl", "-fsSL", "--retry", "5", "--retry-connrefused", url, "-o", str(dest)]
-    ).returncode
+    already what we want here. Returns curl's exit code, not the throttle
+    pipeline's, which only ever reformats output (mirrors
+    _run_docker_build)."""
+    curl_proc = subprocess.Popen(
+        ["curl", "-fL", "--retry", "5", "--retry-connrefused", url, "-o", str(dest)],
+        stderr=subprocess.PIPE,
+    )
+    throttle_proc = subprocess.Popen([_THROTTLE_SCRIPT, _DOWNLOAD_PROGRESS_INTERVAL], stdin=curl_proc.stderr)
+    curl_proc.stderr.close()  # let curl_proc get SIGPIPE if throttle_proc exits early
+    throttle_proc.wait()
+    return curl_proc.wait()
 
 
-# Fed through throttle_progress.sh (see that script for the \r-vs-\n
-# reasoning): tilemaker redraws progress in place for several different
-# counters, all \r-based, while genuine phase-transition messages use a
-# real newline. No --fire-immediately here: a region that builds inside
-# one interval, the common case, logs no progress lines at all.
-_TILEMAKER_PROGRESS_INTERVAL = "60"
-_THROTTLE_SCRIPT = str(pathlib.Path(__file__).parent / "throttle_progress.sh")
+# tilemaker's docker-entrypoint.sh (github.com/systemed/tilemaker
+# resources/docker-entrypoint.sh) echoes this exact 5-line banner
+# unconditionally, before tilemaker itself even starts, regardless of
+# whether --store is already passed (which it is, below): not a signal
+# about *this* run, just fixed noise on every single region. No flag
+# suppresses it (it's not tilemaker printing it), so it's filtered here
+# instead of patching the upstream image. Matched line-for-line rather
+# than a loose "DOCKER WARNING:"/"-+" prefix so a real, different Docker
+# or tilemaker warning (a distinct message, or in some future image
+# version) isn't silently swallowed too.
+_TILEMAKER_NOISE_ERE = (
+    r'^-{80}$'
+    r'|^DOCKER WARNING: Docker Out Of Memory handling can be unreliable\.$'
+    r'|^DOCKER WARNING: If your program unexpectedly exits, it might have been terminated by the Out Of Memory killer without a visible notice\.$'
+    r'|^DOCKER WARNING: The --store option can be used to partly reduce memory usage\.$'
+)
 
 
 def _run_docker_build(cmd):
     """Runs a tilemaker `docker run` invocation, piping its combined
-    stdout/stderr through throttle_progress.sh. Returns docker's exit code
-    (not the throttle pipeline's, which only ever reformats output)."""
+    stdout/stderr through throttle_progress.sh (dropping _TILEMAKER_NOISE_ERE
+    lines along the way). Returns docker's exit code (not the throttle
+    pipeline's, which only ever reformats output)."""
     sys.stdout.flush()  # keep prior prints ordered before the pipeline's direct writes to the same fd
     docker_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    throttle_proc = subprocess.Popen([_THROTTLE_SCRIPT, _TILEMAKER_PROGRESS_INTERVAL], stdin=docker_proc.stdout)
+    throttle_proc = subprocess.Popen(
+        [_THROTTLE_SCRIPT, _TILEMAKER_PROGRESS_INTERVAL, _TILEMAKER_NOISE_ERE], stdin=docker_proc.stdout
+    )
     docker_proc.stdout.close()  # let docker_proc get SIGPIPE if throttle_proc exits early
     throttle_proc.wait()
     return docker_proc.wait()

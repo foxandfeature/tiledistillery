@@ -19,13 +19,30 @@
 # source, via the read timeout below), once INTERVAL seconds pass since
 # the last print, or at EOF.
 #
-# Usage: some_noisy_command 2>&1 | throttle_progress.sh <interval_seconds>
+# \n lines identical to the one just shown collapse too (e.g. a per-group
+# stats line a tool logs once per group, with no \r involved at all):
+# instead of reprinting each occurrence, the first is shown immediately
+# as always and later repeats are held back and folded into that same
+# line as a "(Nx)" suffix, applying the same "at most once per INTERVAL,
+# or when something ends the run" throttling as \r redraws get. Unlike a
+# superseded \r redraw, a finished repeat run isn't discarded, since the
+# count itself is the useful part.
+#
+# Usage: some_noisy_command 2>&1 | throttle_progress.sh <interval_seconds> [exclude_ere]
+#
+# exclude_ere (optional) is an extended regex matched against each
+# complete \n-terminated line; matches are dropped instead of printed.
+# For a caller-known banner that's pure noise (e.g. a wrapper script's
+# own hardcoded warning, unconditional and unrelated to this particular
+# run), not a general log filter: it only ever sees whole \n lines, never
+# a still-accumulating \r redraw, so it can't cut a redraw off mid-line.
 #
 # No `set -e`: `read -t`'s non-zero exit on timeout/EOF is expected here,
 # not an error to abort on.
 set -u
 
 interval="$1"
+exclude_ere="${2:-}"
 
 # partial_line: characters seen since the last \r or \n boundary, not yet
 #   known whether a \r or \n will end it.
@@ -33,10 +50,20 @@ interval="$1"
 #   waiting for its turn to print (or to be dropped by a \n). A separate
 #   flag is needed because an empty string is a valid pending value (two
 #   \r's in a row with nothing between them).
-# last_shown_at: epoch seconds of the last line this script printed.
+# last_shown_line / last_shown_is_set: the most recent \n line actually
+#   printed, kept around purely to recognize the next \n line as a repeat
+#   of it (same empty-string-is-valid reasoning as pending_is_set).
+# repeat_count: how many times last_shown_line has recurred since it was
+#   printed, not yet folded into a shown "(Nx)" update.
+# last_shown_at: epoch seconds of the last line this script printed,
+#   shared by \r-pending and \n-repeat throttling: one clock for "how
+#   stale is the log right now".
 partial_line=""
 pending_line=""
 pending_is_set=0
+last_shown_line=""
+last_shown_is_set=0
+repeat_count=0
 
 epoch_seconds() {
   # Bash builtin (no fork), unlike `date +%s`: matters here since this
@@ -68,13 +95,58 @@ show_pending_if_due() {
   fi
 }
 
-# \n: a real, complete line. Always prints immediately, and drops any
-# stale pending redraw instead of showing it first: this line already
-# proves the tool moved on.
+# True if $1 matches exclude_ere (always false when no pattern was given,
+# so callers that don't pass one keep every \n line, unchanged).
+line_excluded() {
+  [[ -n "$exclude_ere" && "$1" =~ $exclude_ere ]]
+}
+
+# Prints a "(Nx)" update for the currently-repeating last_shown_line, but
+# only once `interval` seconds have passed since the last print (mirrors
+# show_pending_if_due, and shares its clock).
+show_repeat_if_due() {
+  (( repeat_count > 0 )) || return
+  epoch_seconds
+  if (( NOW_EPOCH - last_shown_at >= interval )); then
+    printf '%s (%dx)\n' "$last_shown_line" "$(( repeat_count + 1 ))"
+    last_shown_at="$NOW_EPOCH"
+    repeat_count=0
+  fi
+}
+
+# Unconditional version of the above: once the repeat run is known to be
+# over (a different line arrived), there's nothing left to wait for.
+flush_repeat() {
+  if (( repeat_count > 0 )); then
+    printf '%s (%dx)\n' "$last_shown_line" "$(( repeat_count + 1 ))"
+    repeat_count=0
+  fi
+}
+
+# \n: a real, complete line. Drops any stale pending redraw first: this
+# line already proves the tool moved on. An excluded line is dropped
+# outright, before touching repeat-tracking state at all, so it can't
+# itself break up a run of repeats on either side of it. Otherwise: a
+# repeat of last_shown_line is held back (see show_repeat_if_due); a
+# genuinely new line flushes whatever repeat count was pending, then
+# prints immediately, same as ever.
 handle_major_line() {
   pending_is_set=0
-  printf '%s\n' "$partial_line"
+  local line="$partial_line"
   partial_line=""
+
+  line_excluded "$line" && return
+
+  if (( last_shown_is_set )) && [[ "$line" == "$last_shown_line" ]]; then
+    (( repeat_count++ ))
+    show_repeat_if_due
+    return
+  fi
+
+  flush_repeat
+  printf '%s\n' "$line"
+  last_shown_line="$line"
+  last_shown_is_set=1
 }
 
 # \r: the tool is repainting its progress line in place.
@@ -94,17 +166,21 @@ handle_stall() {
     promote_partial_to_pending
   fi
   show_pending_if_due
+  show_repeat_if_due
 }
 
-# Both pending_line and partial_line can hold real, never-shown content
-# once the stream ends: pending_line from a \r that never became due,
-# partial_line from further output after it with no terminator yet.
-# pending_line is chronologically first. Ends with `return 0`: this is
+# pending_line, partial_line, and a pending repeat count can all hold
+# real, never-shown content once the stream ends: pending_line from a \r
+# that never became due, repeat_count from a repeat run that never became
+# due, partial_line from further output after either with no terminator
+# yet. flush_repeat first since it reports on last_shown_line, the
+# chronologically earliest of the three. Ends with `return 0`: this is
 # the script's last function call, so whether there happened to be
 # anything trailing here must not become the script's own exit status
 # (GitHub Actions runs with pipefail, so a nonzero exit here would fail
 # the whole step).
 flush_remaining() {
+  flush_repeat
   if (( pending_is_set )); then
     printf '%s\n' "$pending_line"
   fi
