@@ -100,8 +100,22 @@ promote_partial_to_pending() {
 # is still empty (nothing printed yet, see its declaration above). Closes
 # out a still-open last_shown_line first: a \r redraw is a new, unrelated
 # line, not a continuation of whatever repeat run was pending on that one.
+#
+# The immediate-print bypass requires pending_line to be non-empty too:
+# tools that write \r as a prefix before each row (curl's progress meter
+# does) produce an empty first "redraw" from the \r immediately following
+# the preceding \n, before any row content has accumulated. Left eligible
+# for the bypass, that content-free artifact would itself become "the
+# first shown line", burning the exception on a blank line and leaving
+# the real first row (arriving microseconds later) to wait out a full
+# `interval` like any other update. Skipping it here just leaves it
+# pending, same as before this bypass existed: promote_partial_to_pending
+# overwrites it with the real row on the very next \r.
 show_pending_if_due() {
   (( pending_is_set )) || return
+  if [[ -z "$last_shown_at" && -z "$pending_line" ]]; then
+    return
+  fi
   epoch_seconds
   if [[ -z "$last_shown_at" ]] || (( NOW_EPOCH - last_shown_at >= interval )); then
     flush_repeat
