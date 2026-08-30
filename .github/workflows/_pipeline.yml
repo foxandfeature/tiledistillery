@@ -173,12 +173,16 @@ jobs:
       # No merge-multiple: every buffer shares the filename timings-buffer.jsonl,
       # so flattening would overwrite them. Per-artifact subdirs are fine since
       # flush-timings searches --timings-dir recursively.
+      #
+      # continue-on-error: v4 has no if-no-artifact-found (that's an
+      # upload-artifact input); it errors when a pattern matches zero
+      # artifacts, which happens if every worker claimed nothing.
       - name: Download every worker's timing buffer
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: timings-*
           path: timings
-          if-no-artifact-found: ignore
 
       - name: Merge into shared timing histor
         env:

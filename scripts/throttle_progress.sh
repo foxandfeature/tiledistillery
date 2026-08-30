@@ -63,7 +63,14 @@ exclude_ere="${2:-}"
 #   printed, not yet folded into a shown "(Nx)" update.
 # last_shown_at: epoch seconds of the last line this script printed,
 #   shared by \r-pending and \n-repeat throttling: one clock for "how
-#   stale is the log right now".
+#   stale is the log right now". Starts empty, not seeded with the
+#   script's start time: emptiness itself means "nothing printed yet",
+#   which both due-checks below treat as immediately due. That's what
+#   makes the very first \r redraw print right away instead of waiting up
+#   to `interval` seconds after launch (e.g. a download tool's progress
+#   bar that opens with \r redraws, before any \n line ever primes the
+#   clock). Once anything is printed, this holds a real epoch value and
+#   ordinary interval throttling takes over.
 partial_line=""
 pending_line=""
 pending_is_set=0
@@ -71,15 +78,13 @@ last_shown_line=""
 last_shown_is_set=0
 last_shown_open=0
 repeat_count=0
+last_shown_at=""
 
 epoch_seconds() {
   # Bash builtin (no fork), unlike `date +%s`: matters here since this
   # runs once per \r seen, not once per printed line.
   printf -v NOW_EPOCH '%(%s)T' -1
 }
-
-epoch_seconds
-last_shown_at="$NOW_EPOCH"
 
 # Moves partial_line into pending_line, as a \r boundary or a stall
 # timeout both do: either way, whatever was accumulating is now a
@@ -90,14 +95,15 @@ promote_partial_to_pending() {
   partial_line=""
 }
 
-# Prints pending_line and resets the throttle clock, but only once
-# `interval` seconds have passed since the last print. Closes out a
-# still-open last_shown_line first: a \r redraw is a new, unrelated line,
-# not a continuation of whatever repeat run was pending on that one.
+# Prints pending_line and resets the throttle clock, once `interval`
+# seconds have passed since the last print, or immediately if last_shown_at
+# is still empty (nothing printed yet, see its declaration above). Closes
+# out a still-open last_shown_line first: a \r redraw is a new, unrelated
+# line, not a continuation of whatever repeat run was pending on that one.
 show_pending_if_due() {
   (( pending_is_set )) || return
   epoch_seconds
-  if (( NOW_EPOCH - last_shown_at >= interval )); then
+  if [[ -z "$last_shown_at" ]] || (( NOW_EPOCH - last_shown_at >= interval )); then
     flush_repeat
     printf '%s\n' "$pending_line"
     last_shown_at="$NOW_EPOCH"
@@ -122,7 +128,7 @@ line_excluded() {
 show_repeat_if_due() {
   (( repeat_count > 0 )) || return
   epoch_seconds
-  if (( NOW_EPOCH - last_shown_at >= interval )); then
+  if [[ -z "$last_shown_at" ]] || (( NOW_EPOCH - last_shown_at >= interval )); then
     printf ' (%dx)' "$(( repeat_count + 1 ))"
     last_shown_at="$NOW_EPOCH"
     repeat_count=0
@@ -170,6 +176,7 @@ handle_major_line() {
   last_shown_line="$line"
   last_shown_is_set=1
   last_shown_open=1
+  have_shown=1
 }
 
 # \r: the tool is repainting its progress line in place.
