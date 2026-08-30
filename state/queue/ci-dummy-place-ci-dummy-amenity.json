@@ -1,8 +1,8 @@
 {
   "done": [],
-  "failed": [],
-  "lock": [
+  "failed": [
     "europe/monaco"
   ],
+  "lock": [],
   "remaining": []
 }
