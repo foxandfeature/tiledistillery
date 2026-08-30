@@ -1,1 +1,11 @@
-{}
+{
+  "done": [],
+  "failed": [],
+  "lock": [],
+  "remaining": [
+    {
+      "id": "europe/monaco",
+      "pbf_url": "https://download.geofabrik.de/europe/monaco-latest.osm.pbf"
+    }
+  ]
+}
