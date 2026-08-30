@@ -1,19 +1,10 @@
 {
   "done": [],
   "failed": [],
-  "lock": [],
-  "remaining": [
-    {
-      "id": "europe/monaco",
-      "pbf_url": "https://download.geofabrik.de/europe/monaco-latest.osm.pbf"
-    },
-    {
-      "id": "europe/andorra",
-      "pbf_url": "https://download.geofabrik.de/europe/andorra-latest.osm.pbf"
-    },
-    {
-      "id": "europe/liechtenstein",
-      "pbf_url": "https://download.geofabrik.de/europe/liechtenstein-latest.osm.pbf"
-    }
-  ]
+  "lock": [
+    "europe/andorra",
+    "europe/liechtenstein",
+    "europe/monaco"
+  ],
+  "remaining": []
 }
