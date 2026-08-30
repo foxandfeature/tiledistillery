@@ -24,11 +24,11 @@ on:
   workflow_call:
     inputs:
       config:
-        description: 'Path(s), in the caller repo, to tilemaker JSON layer config(s): one value, or a comma-separated list matched 1:1 with process/output_basename.'
+        description: "Path(s), in the caller repo, to tilemaker JSON layer config(s): one value, or a comma-separated list matched 1:1 with process/output_basename."
         required: true
         type: string
       process:
-        description: 'Path(s), in the caller repo, to tilemaker Lua process script(s), matched 1:1 with config/output_basename.'
+        description: "Path(s), in the caller repo, to tilemaker Lua process script(s), matched 1:1 with config/output_basename."
         required: true
         type: string
       output_basename:
@@ -36,7 +36,7 @@ on:
         required: true
         type: string
       attribution:
-        description: 'HTML attribution string embedded in every output layer''s PMTiles metadata via tile-join --attribution, applied uniformly across the whole config/process/output_basename list.'
+        description: "HTML attribution string embedded in every output layer's PMTiles metadata via tile-join --attribution, applied uniformly across the whole config/process/output_basename list."
         required: true
         type: string
       worker_count:
@@ -196,7 +196,7 @@ jobs:
   # the shared queue, so without it every region would still read back as
   # `remaining`.
   verify-complete:
-    needs: [build, record-timings]
+    needs: [record-timings]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -225,7 +225,7 @@ jobs:
   # "<region>--<output_basename>.mbtiles", so this just globs for its own
   # matrix cell's basename among all downloaded shards.
   merge:
-    needs: [prepare, verify-complete]
+    needs: [verify-complete]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
