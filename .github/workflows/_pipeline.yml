@@ -97,12 +97,14 @@ jobs:
             --state-branch state --output-basename "${{ inputs.output_basename }}" \
             --region-scope "${{ inputs.region_scope }}"
 
-      - id: gen-workers
+      - name: Generate worker matrix
+        id: gen-workers
         env:
           WORKER_COUNT: ${{ inputs.worker_count }}
         run: echo "workers=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["WORKER_COUNT"])))))')" >> "$GITHUB_OUTPUT"
 
-      - id: gen-basenames
+      - name: Generate basename matrix
+        id: gen-basenames
         env:
           OUTPUT_BASENAME: ${{ inputs.output_basename }}
         run: echo "basenames=$(python3 -c 'import json, os; print(json.dumps(os.environ["OUTPUT_BASENAME"].split(",")))')" >> "$GITHUB_OUTPUT"
