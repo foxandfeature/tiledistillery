@@ -1,9 +1,15 @@
 {
+  "europe/andorra": [
+    5
+  ],
+  "europe/liechtenstein": [
+    4
+  ],
   "europe/monaco": [
     4,
     4,
-    4,
     486,
+    4,
     4
   ]
 }
