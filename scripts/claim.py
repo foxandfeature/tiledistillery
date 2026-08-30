@@ -236,13 +236,17 @@ def _download_pbf(url, dest):
     `-s`) or an unreadable flood of \r redraws. `--retry` (no
     `--retry-all-errors`) retries only transient failures (timeouts, 5xx,
     408/429), not a 404/other 4xx: Geofabrik saying the region is genuinely
-    gone shouldn't cost 5 attempts before falling through to the caller's
-    `_record_failed`. No `--retry-delay`: curl's own default backoff is
-    already what we want here. Returns curl's exit code, not the throttle
-    pipeline's, which only ever reformats output (mirrors
-    _run_docker_build)."""
+    gone shouldn't cost several attempts before falling through to the
+    caller's `_record_failed`. No `--retry-delay`: curl's own default
+    exponential backoff (1s, 2s, 4s, ... capped at 10min/attempt) is already
+    what we want here; `--retry 20` just keeps the attempt count from being
+    the limiting factor. `--retry-max-time 1200` is the actual ceiling: a
+    Geofabrik outage has been observed to last up to 15 minutes, so this
+    gives some margin above that before giving up. Returns curl's exit
+    code, not the throttle pipeline's, which only ever reformats output
+    (mirrors _run_docker_build)."""
     curl_proc = subprocess.Popen(
-        ["curl", "-fL", "--retry", "5", "--retry-connrefused", url, "-o", str(dest)],
+        ["curl", "-fL", "--retry", "20", "--retry-max-time", "1200", "--retry-connrefused", url, "-o", str(dest)],
         stderr=subprocess.PIPE,
     )
     throttle_proc = subprocess.Popen([_THROTTLE_SCRIPT, _DOWNLOAD_PROGRESS_INTERVAL], stdin=curl_proc.stderr)
