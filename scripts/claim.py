@@ -274,7 +274,6 @@ def _run_docker_build(cmd):
     stdout/stderr through throttle_progress.sh (dropping _TILEMAKER_NOISE_ERE
     lines along the way). Returns docker's exit code (not the throttle
     pipeline's, which only ever reformats output)."""
-    sys.stdout.flush()  # keep prior prints ordered before the pipeline's direct writes to the same fd
     docker_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     throttle_proc = subprocess.Popen(
         [_THROTTLE_SCRIPT, _TILEMAKER_PROGRESS_INTERVAL, _TILEMAKER_NOISE_ERE], stdin=docker_proc.stdout

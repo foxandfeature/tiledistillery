@@ -36,6 +36,15 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         TILEMAKER_IMAGE: ghcr.io/systemed/tilemaker:master
+        # claim.py interleaves its own print()s with subprocesses
+        # (curl/docker via throttle_progress.sh) that write straight to the
+        # inherited stdout fd, bypassing Python's own buffer. Without this,
+        # Python's stdout is block-buffered (not a tty here), so those
+        # prints can lag behind the subprocesses' direct writes and show up
+        # out of order in the log. See scripts/claim.py's cmd_run_worker/
+        # _run_docker_build for the one spot that already worked around
+        # this locally with an explicit sys.stdout.flush().
+        PYTHONUNBUFFERED: "1"
       # The loop itself, and timings-buffer.jsonl's role, are documented in
       # scripts/claim.py (module + run-worker docstrings).
       run: |

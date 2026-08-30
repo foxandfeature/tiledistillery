@@ -22,11 +22,12 @@
 # \n lines identical to the one just shown collapse too (e.g. a per-group
 # stats line a tool logs once per group, with no \r involved at all):
 # instead of reprinting each occurrence, the first is shown immediately
-# as always and later repeats are held back and folded into that same
-# line as a "(Nx)" suffix, applying the same "at most once per INTERVAL,
-# or when something ends the run" throttling as \r redraws get. Unlike a
-# superseded \r redraw, a finished repeat run isn't discarded, since the
-# count itself is the useful part.
+# as always, without its trailing newline yet (last_shown_open), and
+# later repeats are held back and folded into that same still-open line
+# as a "(Nx)" suffix rather than a full reprint, applying the same "at
+# most once per INTERVAL, or when something ends the run" throttling as
+# \r redraws get. Unlike a superseded \r redraw, a finished repeat run
+# isn't discarded, since the count itself is the useful part.
 #
 # Usage: some_noisy_command 2>&1 | throttle_progress.sh <interval_seconds> [exclude_ere]
 #
@@ -53,6 +54,11 @@ exclude_ere="${2:-}"
 # last_shown_line / last_shown_is_set: the most recent \n line actually
 #   printed, kept around purely to recognize the next \n line as a repeat
 #   of it (same empty-string-is-valid reasoning as pending_is_set).
+# last_shown_open: last_shown_line was printed without its trailing
+#   newline yet, in case it turns out to be the start of a repeat run
+#   whose count needs to land on that same line. Closed (newline emitted,
+#   with or without a "(Nx)" suffix) as soon as anything else needs to
+#   print: a different \n line, a \r redraw, or EOF.
 # repeat_count: how many times last_shown_line has recurred since it was
 #   printed, not yet folded into a shown "(Nx)" update.
 # last_shown_at: epoch seconds of the last line this script printed,
@@ -63,6 +69,7 @@ pending_line=""
 pending_is_set=0
 last_shown_line=""
 last_shown_is_set=0
+last_shown_open=0
 repeat_count=0
 
 epoch_seconds() {
@@ -84,11 +91,14 @@ promote_partial_to_pending() {
 }
 
 # Prints pending_line and resets the throttle clock, but only once
-# `interval` seconds have passed since the last print.
+# `interval` seconds have passed since the last print. Closes out a
+# still-open last_shown_line first: a \r redraw is a new, unrelated line,
+# not a continuation of whatever repeat run was pending on that one.
 show_pending_if_due() {
   (( pending_is_set )) || return
   epoch_seconds
   if (( NOW_EPOCH - last_shown_at >= interval )); then
+    flush_repeat
     printf '%s\n' "$pending_line"
     last_shown_at="$NOW_EPOCH"
     pending_is_set=0
@@ -101,26 +111,38 @@ line_excluded() {
   [[ -n "$exclude_ere" && "$1" =~ $exclude_ere ]]
 }
 
-# Prints a "(Nx)" update for the currently-repeating last_shown_line, but
-# only once `interval` seconds have passed since the last print (mirrors
-# show_pending_if_due, and shares its clock).
+# Appends a "(Nx)" update onto the still-open last_shown_line, but only
+# once `interval` seconds have passed since the last print (mirrors
+# show_pending_if_due, and shares its clock). No newline: the run may
+# still keep going, in which case a later due update overwrites nothing
+# but simply appends again, and only flush_repeat closes the line for
+# good. No re-printing of last_shown_line itself, unlike a superseded \r
+# redraw: it's still sitting there on the terminal/log from when it was
+# first shown.
 show_repeat_if_due() {
   (( repeat_count > 0 )) || return
   epoch_seconds
   if (( NOW_EPOCH - last_shown_at >= interval )); then
-    printf '%s (%dx)\n' "$last_shown_line" "$(( repeat_count + 1 ))"
+    printf ' (%dx)' "$(( repeat_count + 1 ))"
     last_shown_at="$NOW_EPOCH"
     repeat_count=0
   fi
 }
 
-# Unconditional version of the above: once the repeat run is known to be
-# over (a different line arrived), there's nothing left to wait for.
+# Closes out last_shown_line for good once its repeat run is known to be
+# over (a different line arrived, a \r redraw needs the terminal, or
+# EOF). If repeats accrued since the last show_repeat_if_due, appends a
+# final "(Nx)" first; either way, emits the newline that was withheld
+# when the line was first printed. A no-op once last_shown_open is
+# already 0, so callers can call it unconditionally.
 flush_repeat() {
+  (( last_shown_open )) || return
   if (( repeat_count > 0 )); then
-    printf '%s (%dx)\n' "$last_shown_line" "$(( repeat_count + 1 ))"
+    printf ' (%dx)' "$(( repeat_count + 1 ))"
     repeat_count=0
   fi
+  printf '\n'
+  last_shown_open=0
 }
 
 # \n: a real, complete line. Drops any stale pending redraw first: this
@@ -144,9 +166,10 @@ handle_major_line() {
   fi
 
   flush_repeat
-  printf '%s\n' "$line"
+  printf '%s' "$line"
   last_shown_line="$line"
   last_shown_is_set=1
+  last_shown_open=1
 }
 
 # \r: the tool is repainting its progress line in place.
